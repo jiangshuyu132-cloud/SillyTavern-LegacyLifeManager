@@ -11,6 +11,7 @@ import {
     safeFilename,
     upsertArchive,
 } from './core.js';
+import { createMvuAdapter } from './mvu-adapter.js';
 
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
@@ -62,84 +63,9 @@ function latestMessageIndex() {
     return Math.max(0, (context()?.chat?.length || 1) - 1);
 }
 
-function parseMaybeJson(value) {
-    if (typeof value !== 'string') return value;
-    try { return JSON.parse(value); } catch { return value; }
-}
-
-function messageVariableApi(name) {
-    if (typeof globalThis[name] === 'function') return { owner: globalThis, fn: globalThis[name] };
-    if (typeof globalThis.TavernHelper?.[name] === 'function') {
-        return { owner: globalThis.TavernHelper, fn: globalThis.TavernHelper[name] };
-    }
-    return null;
-}
-
-function readFromMessageObject(message) {
-    const candidates = [
-        message?.variables?.stat_data,
-        message?.extra?.variables?.stat_data,
-        message?.extra?.stat_data,
-        message?.data?.stat_data,
-        message?.stat_data,
-    ];
-    for (const candidate of candidates) {
-        const value = parseMaybeJson(candidate);
-        if (value && typeof value === 'object') return value;
-    }
-    return null;
-}
-
-function readStatData() {
-    const ctx = context();
-    if (!ctx?.chat) return {};
-    const reader = messageVariableApi('getMessageVar');
-    if (reader) {
-        for (let index = latestMessageIndex(); index >= 0; index -= 1) {
-            try {
-                const value = reader.fn.call(reader.owner, 'stat_data', {
-                    scope: 'message', index, defaults: undefined, noCache: true, clone: true,
-                });
-                const parsed = parseMaybeJson(value);
-                if (parsed && typeof parsed === 'object') return parsed;
-            } catch { /* try the stored message object */ }
-        }
-    }
-    for (let index = ctx.chat.length - 1; index >= 0; index -= 1) {
-        const value = readFromMessageObject(ctx.chat[index]);
-        if (value) return value;
-    }
-    return {};
-}
-
-function setFallbackPath(fullPath, value) {
-    const ctx = context();
-    const message = ctx?.chat?.[latestMessageIndex()];
-    if (!message) throw new Error('找不到可写入的最新消息变量');
-    const root = readFromMessageObject(message);
-    if (!root) throw new Error('没有检测到 MVU 的 stat_data；请确认已安装并启用酒馆助手/MVU');
-    const parts = fullPath.replace(/^stat_data\.?/, '').split('.').filter(Boolean);
-    let parent = root;
-    for (const part of parts.slice(0, -1)) {
-        parent[part] ??= {};
-        parent = parent[part];
-    }
-    parent[parts.at(-1)] = value;
-    message.variables ??= {};
-    message.variables.stat_data = root;
-    ctx.saveChat?.();
-}
-
-async function writeMessagePath(path, value) {
-    const writer = messageVariableApi('setMessageVar');
-    if (writer) {
-        await Promise.resolve(writer.fn.call(writer.owner, path, value, {
-            scope: 'message', index: latestMessageIndex(), noCache: true,
-        }));
-        return;
-    }
-    setFallbackPath(path, value);
-}
+const mvu = createMvuAdapter({ env: globalThis, getContext: context, getLatestMessageIndex: latestMessageIndex });
+const readStatData = () => mvu.readStatData();
+const writeMessagePath = (path, value) => mvu.writeMessagePath(path, value);
 
 function currentWorldBookName() {
     const ctx = context();
@@ -511,7 +437,7 @@ export async function init() {
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
     registerEvents();
     await render();
-    console.log('[历代人生管理器] v0.1.0 已加载');
+    console.log('[历代人生管理器] v0.1.1 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
