@@ -12,6 +12,7 @@ import {
     safeFilename,
     upsertArchive,
 } from '../core.js';
+import { createMvuAdapter, statDataFromMessage, statDataFromVariables } from '../mvu-adapter.js';
 
 test('asObject parses JSON and rejects arrays', () => {
     assert.deepEqual(asObject('{"a":1}'), { a: 1 });
@@ -71,4 +72,48 @@ test('detectCarryover flags exact non-empty sensitive fields', () => {
 
 test('safeFilename strips reserved characters', () => {
     assert.equal(safeFilename('a/b:c?.json'), 'a-b-c-.json');
+});
+
+test('statDataFromVariables reads object and JSON forms', () => {
+    assert.deepEqual(statDataFromVariables({ stat_data: { 主角: { 等级: 2 } } }), { 主角: { 等级: 2 } });
+    assert.deepEqual(statDataFromVariables({ stat_data: '{"主角":{"等级":3}}' }), { 主角: { 等级: 3 } });
+});
+
+test('statDataFromMessage supports SillyTavern storage fallbacks', () => {
+    assert.deepEqual(statDataFromMessage({ extra: { variables: { stat_data: { 主角: { 等级: 4 } } } } }), { 主角: { 等级: 4 } });
+});
+
+test('MVU adapter reads exact message floors through TavernHelper.getVariables', () => {
+    const chat = [{}, {}, {}];
+    const calls = [];
+    const env = { TavernHelper: { getVariables(option) {
+        calls.push(option);
+        return option.message_id === 1 ? { stat_data: { 主角: { 等级: 5 } } } : {};
+    } } };
+    const adapter = createMvuAdapter({ env, getContext: () => ({ chat }), getLatestMessageIndex: () => 2 });
+    assert.deepEqual(adapter.readStatData(), { 主角: { 等级: 5 } });
+    assert.deepEqual(calls.map(call => call.message_id), [2, 1]);
+});
+
+test('MVU adapter falls back to Mvu.getMvuData', () => {
+    const env = { Mvu: { getMvuData: ({ message_id }) => message_id === 0 ? { stat_data: { 主角: { 等级: 6 } } } : {} } };
+    const adapter = createMvuAdapter({ env, getContext: () => ({ chat: [{}, {}] }), getLatestMessageIndex: () => 1 });
+    assert.equal(adapter.readStatData().主角.等级, 6);
+});
+
+test('MVU adapter writes through updateVariablesWith without replacing unrelated data', async () => {
+    let stored = { stat_data: { 主角: { 换身状态: {} } }, unrelated: { keep: true } };
+    let receivedOption;
+    const env = { TavernHelper: {
+        updateVariablesWith(updater, option) {
+            receivedOption = option;
+            stored = updater(stored);
+            return stored;
+        },
+    } };
+    const adapter = createMvuAdapter({ env, getContext: () => ({ chat: [{}] }), getLatestMessageIndex: () => 0 });
+    await adapter.writeMessagePath('stat_data.主角.换身状态.阶段', '等待确认');
+    assert.equal(stored.stat_data.主角.换身状态.阶段, '等待确认');
+    assert.equal(stored.unrelated.keep, true);
+    assert.deepEqual(receivedOption, { type: 'message', message_id: 'latest' });
 });
