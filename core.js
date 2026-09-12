@@ -27,6 +27,52 @@ export function getPath(value, path, fallback) {
     return current;
 }
 
+export function formatSummaryValue(value, fallback = '当前变量未提供') {
+    if (Array.isArray(value)) {
+        const text = value.map(item => String(item ?? '').trim()).filter(Boolean).join('、');
+        return text || fallback;
+    }
+    if (value == null) return fallback;
+    const text = String(value).trim();
+    return text || fallback;
+}
+
+function resourceMaximum(resource) {
+    const maximum = asObject(resource?.上限);
+    const base = Number(maximum?._基础);
+    const extra = Number(maximum?.额外);
+    if (!Number.isFinite(base) && !Number.isFinite(extra)) return null;
+    return (Number.isFinite(base) ? base : 0) + (Number.isFinite(extra) ? extra : 0);
+}
+
+export function currentBodySummary(statData = {}) {
+    const main = asObject(statData?.主角);
+    const profile = asObject(main.载体档案);
+    const hp = asObject(main.生命值);
+    const effects = Object.keys(asObject(main.状态效果));
+    let health = profile.伤病与健康;
+    if (!health && (hp.当前 != null || resourceMaximum(hp) != null)) {
+        const current = formatSummaryValue(hp.当前);
+        const maximum = resourceMaximum(hp);
+        health = `生命值 ${current}/${maximum ?? '当前变量未提供'}`;
+        health += effects.length ? ` · 状态：${effects.join('、')}` : ' · 无状态效果';
+    }
+    return {
+        name: formatSummaryValue(profile.姓名 || main.姓名, '当前变量未提供姓名'),
+        main,
+        rows: [
+            ['原主', formatSummaryValue(profile.原主姓名 || main.原主姓名)],
+            ['年龄', formatSummaryValue(profile.年龄 || main.年龄)],
+            ['性别', formatSummaryValue(profile.性别 || main.性别)],
+            ['种族', formatSummaryValue(main.种族)],
+            ['身份', formatSummaryValue(main.身份, '暂无身份')],
+            ['职业', formatSummaryValue(main.职业, '暂无职业')],
+            ['地点', formatSummaryValue(profile.当前地点与处境 || getPath(statData, '世界.地点'))],
+            ['健康', formatSummaryValue(health)],
+        ],
+    };
+}
+
 export function normalizeStage(value) {
     return ['当前身体生效', '等待换身', '等待确认'].includes(value) ? value : '未知';
 }
