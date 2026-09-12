@@ -3,6 +3,7 @@ import {
     archiveKeywords,
     archiveTitle,
     asObject,
+    currentBodySummary,
     detectCarryover,
     extractCharacterCard,
     getPath,
@@ -258,17 +259,14 @@ function el(tag, className, text) {
 }
 
 function renderCurrent(panel, statData) {
-    const main = statData.主角 || {};
-    const profile = main.载体档案 || {};
+    const summary = currentBodySummary(statData);
+    const main = summary.main;
     const header = el('div', 'llm-card-head');
-    header.append(el('div', 'llm-avatar', '◈'), el('div', '', profile.姓名 || '未建立当前身体资料'));
+    header.append(el('div', 'llm-avatar', '◈'), el('div', '', summary.name));
     const grid = el('div', 'llm-summary-grid');
-    for (const [label, value] of [
-        ['原主', profile.原主姓名], ['年龄', profile.年龄], ['性别', profile.性别], ['种族', main.种族],
-        ['身份', main.身份], ['职业', main.职业], ['地点', profile.当前地点与处境], ['健康', profile.伤病与健康],
-    ]) {
+    for (const [label, value] of summary.rows) {
         const item = el('div', 'llm-summary-item');
-        item.append(el('span', '', label), el('strong', '', Array.isArray(value) ? value.join('、') : value || '—'));
+        item.append(el('span', '', label), el('strong', '', value));
         grid.append(item);
     }
     const details = document.createElement('details');
@@ -437,7 +435,7 @@ export async function init() {
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
     registerEvents();
     await render();
-    console.log('[历代人生管理器] v0.1.1 已加载');
+    console.log('[历代人生管理器] v0.1.2 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
