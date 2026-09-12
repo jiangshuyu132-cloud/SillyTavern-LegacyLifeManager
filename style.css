@@ -1,0 +1,138 @@
+#legacy-life-manager-root {
+    --llm-accent: #9b7bff;
+    --llm-border: color-mix(in srgb, var(--SmartThemeBodyColor, #ddd) 22%, transparent);
+}
+
+#legacy-life-manager-root .inline-drawer-content {
+    padding: 0.75rem;
+}
+
+.llm-help,
+.llm-muted {
+    opacity: 0.78;
+    line-height: 1.5;
+}
+
+.llm-tabs,
+.llm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin: 0.7rem 0;
+}
+
+.llm-tab.active,
+.llm-primary {
+    border-color: var(--llm-accent) !important;
+    box-shadow: inset 0 0 0 1px var(--llm-accent);
+}
+
+.llm-panel {
+    display: grid;
+    gap: 0.7rem;
+}
+
+.llm-card-head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+}
+
+.llm-avatar {
+    display: grid;
+    place-items: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    border: 1px solid var(--llm-accent);
+    border-radius: 50%;
+    color: var(--llm-accent);
+}
+
+.llm-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.55rem;
+}
+
+.llm-summary-item,
+.llm-life,
+.llm-safety,
+.llm-warning,
+.llm-empty {
+    padding: 0.65rem;
+    border: 1px solid var(--llm-border);
+    border-radius: 0.55rem;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 76%, transparent);
+}
+
+.llm-summary-item span {
+    display: block;
+    margin-bottom: 0.2rem;
+    opacity: 0.68;
+    font-size: 0.82rem;
+}
+
+.llm-summary-item strong {
+    overflow-wrap: anywhere;
+}
+
+.llm-json,
+.llm-life-content {
+    max-height: 25rem;
+    overflow: auto;
+    padding: 0.75rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border-radius: 0.4rem;
+    background: rgb(0 0 0 / 22%);
+    font-size: 0.86rem;
+    line-height: 1.5;
+}
+
+.llm-card-preview {
+    min-height: 6rem;
+}
+
+.llm-label {
+    display: grid;
+    gap: 0.35rem;
+    font-weight: 600;
+}
+
+.llm-stage {
+    width: fit-content;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid var(--llm-border);
+    border-radius: 999px;
+}
+
+.stage-等待确认,
+.llm-warning {
+    border-color: #d6a84d;
+    color: #ffd98a;
+}
+
+.stage-当前身体生效 {
+    border-color: #58b889;
+}
+
+.llm-life-list {
+    display: grid;
+    gap: 0.5rem;
+}
+
+.llm-life > summary {
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.llm-safety {
+    line-height: 1.55;
+}
+
+@media (max-width: 600px) {
+    .llm-summary-grid { grid-template-columns: 1fr; }
+    .llm-actions > button { flex: 1 1 100%; }
+}
