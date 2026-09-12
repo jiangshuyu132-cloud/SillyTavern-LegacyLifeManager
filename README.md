@@ -46,7 +46,7 @@
 
 ## 兼容性
 
-需要当前 SillyTavern 的 `SillyTavern.getContext()` 公共接口。读取 MVU 时优先使用酒馆助手暴露的 `getMessageVar/setMessageVar`，并为常见的消息变量结构提供兼容回退。
+需要当前 SillyTavern 的 `SillyTavern.getContext()` 公共接口。读取和写入 MVU 时优先使用酒馆助手提供给扩展的 `TavernHelper.getVariables/updateVariablesWith`，其次使用 `Mvu.getMvuData/replaceMvuData`，并为旧版接口及常见消息变量结构保留兼容回退。
 
 ## 开发检查
 
