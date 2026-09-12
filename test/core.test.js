@@ -4,11 +4,13 @@ import {
     archiveKeywords,
     archiveTitle,
     asObject,
+    currentBodySummary,
     detectCarryover,
     extractCharacterCard,
     getPath,
     normalizeEntries,
     normalizeStage,
+    formatSummaryValue,
     safeFilename,
     upsertArchive,
 } from '../core.js';
@@ -72,6 +74,44 @@ test('detectCarryover flags exact non-empty sensitive fields', () => {
 
 test('safeFilename strips reserved characters', () => {
     assert.equal(safeFilename('a/b:c?.json'), 'a-b-c-.json');
+});
+
+test('formatSummaryValue renders arrays and explicit empty labels', () => {
+    assert.equal(formatSummaryValue(['学生', '冒险者']), '学生、冒险者');
+    assert.equal(formatSummaryValue([], '暂无身份'), '暂无身份');
+    assert.equal(formatSummaryValue(''), '当前变量未提供');
+});
+
+test('currentBodySummary prefers the new carrier profile', () => {
+    const result = currentBodySummary({
+        主角: {
+            载体档案: { 姓名: '林', 年龄: '20', 当前地点与处境: '旅店', 伤病与健康: '健康' },
+            种族: '精灵', 身份: ['旅人'], 职业: ['法师'],
+        },
+        世界: { 地点: '旧地点' },
+    });
+    assert.equal(result.name, '林');
+    assert.deepEqual(Object.fromEntries(result.rows), {
+        原主: '当前变量未提供', 年龄: '20', 性别: '当前变量未提供', 种族: '精灵',
+        身份: '旅人', 职业: '法师', 地点: '旅店', 健康: '健康',
+    });
+});
+
+test('currentBodySummary makes legacy chat fields useful without guessing missing data', () => {
+    const result = currentBodySummary({
+        主角: {
+            种族: '人类', 身份: [], 职业: [],
+            生命值: { 当前: 206, 上限: { _基础: 200, 额外: 6 } },
+            状态效果: {},
+        },
+        世界: { 地点: '铁炉堡-城防值班室' },
+    });
+    const rows = Object.fromEntries(result.rows);
+    assert.equal(result.name, '当前变量未提供姓名');
+    assert.equal(rows.身份, '暂无身份');
+    assert.equal(rows.职业, '暂无职业');
+    assert.equal(rows.地点, '铁炉堡-城防值班室');
+    assert.equal(rows.健康, '生命值 206/206 · 无状态效果');
 });
 
 test('statDataFromVariables reads object and JSON forms', () => {
