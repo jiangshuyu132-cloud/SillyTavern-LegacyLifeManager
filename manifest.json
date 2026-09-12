@@ -1,0 +1,15 @@
+{
+  "display_name": "历代人生管理器",
+  "loading_order": 220,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Codex & SillyTavern user",
+  "version": "0.1.0",
+  "auto_update": true,
+  "homePage": "https://github.com/jiangshuyu132-cloud/SillyTavern-LegacyLifeManager",
+  "hooks": {
+    "activate": "init"
+  }
+}
