@@ -58,6 +58,7 @@
 
 .llm-summary-item,
 .llm-life,
+.llm-life-card,
 .llm-safety,
 .llm-warning,
 .llm-empty {
@@ -121,6 +122,23 @@
 .llm-life-list {
     display: grid;
     gap: 0.5rem;
+}
+
+.llm-life-card {
+    display: grid;
+    gap: 0.45rem;
+}
+
+.llm-life-title {
+    color: var(--llm-accent);
+    font-size: 1.05rem;
+    font-weight: 700;
+}
+
+.llm-life-summary {
+    margin: 0;
+    line-height: 1.65;
+    white-space: pre-wrap;
 }
 
 .llm-life > summary {

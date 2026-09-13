@@ -3,12 +3,12 @@ import {
     archiveKeywords,
     archiveTitle,
     asObject,
+    confirmedCarrierProfile,
     currentBodySummary,
     detectCarryover,
-    extractCharacterCard,
     getPath,
+    lifeHistorySummaries,
     normalizeEntries,
-    normalizeStage,
     safeFilename,
     supplementalPlayerProfile,
     upsertArchive,
@@ -19,7 +19,6 @@ const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 1 });
 let initialized = false;
-let selectedMessageIndex = '';
 
 function context() {
     return globalThis.SillyTavern?.getContext?.();
@@ -87,57 +86,6 @@ function downloadJson(filename, payload) {
     link.download = safeFilename(filename);
     link.click();
     URL.revokeObjectURL(url);
-}
-
-function assistantMessages() {
-    return (context()?.chat || [])
-        .map((message, index) => ({ message, index }))
-        .filter(({ message }) => message && !message.is_user && !message.is_system && String(message.mes || '').trim())
-        .slice(-30)
-        .reverse();
-}
-
-function selectedCard() {
-    const index = Number(selectedMessageIndex);
-    const message = context()?.chat?.[index];
-    return message ? extractCharacterCard(message.mes) : '';
-}
-
-async function importCandidate() {
-    const card = selectedCard();
-    if (!card) {
-        notify('warning', '本条回复中没有识别到人物卡；请选择包含人物卡的 AI 回复');
-        return;
-    }
-    const statData = readStatData();
-    const state = getPath(statData, '主角.换身状态', {});
-    if (state?.当前身体死亡已确认 !== true) {
-        notify('warning', '当前身体尚未确认死亡，不能把人物卡写入换身候选');
-        return;
-    }
-    if (!globalThis.confirm('只把所选人物卡写入“待确认人物卡”，不会立即换身。继续吗？')) return;
-    await writeMessagePath('stat_data.主角.换身状态.待确认人物卡', card);
-    await writeMessagePath('stat_data.主角.换身状态.阶段', '等待确认');
-    notify('success', '候选人物卡已写入；仍需你发送精确口令“确认换身”');
-    render();
-}
-
-function prepareConfirmation() {
-    const statData = readStatData();
-    const state = getPath(statData, '主角.换身状态', {});
-    if (state?.阶段 !== '等待确认' || state?.当前身体死亡已确认 !== true || !state?.待确认人物卡) {
-        notify('warning', '尚未满足换身条件：需要真正死亡、阶段为“等待确认”且候选人物卡非空');
-        return;
-    }
-    const textarea = document.querySelector('#send_textarea, textarea[placeholder*="消息"], textarea[placeholder*="message"]');
-    if (!textarea) {
-        notify('warning', '找不到聊天输入框，请手动发送：确认换身');
-        return;
-    }
-    textarea.value = '确认换身';
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    textarea.focus();
-    notify('info', '已填入“确认换身”，请核对后由你亲自发送');
 }
 
 async function verifyWorldBook(name, title, content) {
@@ -260,7 +208,11 @@ function el(tag, className, text) {
 }
 
 function renderCurrent(panel, statData) {
-    const summary = currentBodySummary(statData, supplementalPlayerProfile(context()?.chat || [], statData));
+    const messages = context()?.chat || [];
+    const confirmedProfile = confirmedCarrierProfile(messages);
+    const hasConfirmedProfile = Object.keys(confirmedProfile).length > 0;
+    const chatProfile = hasConfirmedProfile ? confirmedProfile : supplementalPlayerProfile(messages, statData);
+    const summary = currentBodySummary(statData, chatProfile, { preferSupplemental: hasConfirmedProfile });
     const main = summary.main;
     const header = el('div', 'llm-card-head');
     header.append(el('div', 'llm-avatar', '◈'), el('div', '', summary.name));
@@ -275,7 +227,9 @@ function renderCurrent(panel, statData) {
     const warnings = carryoverWarnings(statData);
     panel.append(header, grid);
     if (summary.usedSupplementalProfile) {
-        panel.append(el('div', 'llm-muted', '人物资料来自当前聊天的人物卡；地点、生命值与状态来自 stat_data。'));
+        panel.append(el('div', 'llm-muted', hasConfirmedProfile
+            ? '当前身份来自最近一次已确认换身的人物卡；地点、生命值与状态读取最新 stat_data。'
+            : '人物资料来自当前聊天的人物卡；地点、生命值与状态读取最新 stat_data。'));
     }
     if (warnings.length) {
         const warning = el('div', 'llm-warning');
@@ -285,64 +239,33 @@ function renderCurrent(panel, statData) {
     panel.append(details);
 }
 
-function renderSwitch(panel, statData) {
-    const state = getPath(statData, '主角.换身状态', {});
-    const badge = el('div', `llm-stage stage-${normalizeStage(state?.阶段)}`, `当前阶段：${normalizeStage(state?.阶段)}`);
-    const facts = el('div', 'llm-summary-grid');
-    for (const [label, value] of [
-        ['世代编号', state?.当前世代编号], ['死亡已确认', state?.当前身体死亡已确认 ? '是' : '否'],
-        ['归档状态', state?.归档写入状态], ['死亡信息', state?.当前身体死亡信息],
-    ]) {
-        const item = el('div', 'llm-summary-item');
-        item.append(el('span', '', label), el('strong', '', value ?? '—'));
-        facts.append(item);
-    }
-    const select = document.createElement('select');
-    select.className = 'text_pole';
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = '选择含人物卡的 AI 回复…';
-    select.append(placeholder);
-    for (const { message, index } of assistantMessages()) {
-        const option = document.createElement('option');
-        option.value = String(index);
-        option.textContent = `#${index} ${String(message.mes).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 72)}`;
-        option.selected = String(index) === selectedMessageIndex;
-        select.append(option);
-    }
-    select.addEventListener('change', () => { selectedMessageIndex = select.value; render(); });
-    const preview = el('pre', 'llm-json llm-card-preview', selectedCard() || '尚未选择，或所选回复未识别到人物卡。');
-    const actions = el('div', 'llm-actions');
-    actions.append(
-        createButton('导入为待确认人物卡', importCandidate),
-        createButton('填入“确认换身”', prepareConfirmation),
-        createButton('归档上一世到世界书', archivePendingLife, 'menu_button llm-primary'),
-    );
-    panel.append(badge, facts, el('label', 'llm-label', '从正文选择候选人物卡'), select, preview, actions);
-}
-
 async function renderLives(panel, statData) {
     const name = currentWorldBookName();
     const book = name ? await context()?.loadWorldInfo?.(name) : null;
-    const entries = book ? Object.values(normalizeEntries(book)).filter(entry => String(entry?.comment || '').startsWith(ARCHIVE_PREFIX)) : [];
+    const entries = book ? Object.values(normalizeEntries(book)) : [];
+    const summaries = lifeHistorySummaries(context()?.chat || [], statData, entries);
     const search = document.createElement('input');
     search.className = 'text_pole';
-    search.placeholder = '搜索姓名、人物、地点或事件';
+    search.placeholder = '搜索姓名或经历';
     const list = el('div', 'llm-life-list');
     const draw = () => {
         const needle = search.value.trim().toLowerCase();
         list.replaceChildren();
-        const visible = entries.filter(entry => !needle || `${entry.comment}\n${entry.content}\n${(entry.key || []).join(' ')}`.toLowerCase().includes(needle));
-        if (!visible.length) list.append(el('div', 'llm-empty', name ? '没有匹配的历代人生词条。' : '请先在设置中选择世界书。'));
-        for (const entry of visible) {
-            const details = document.createElement('details');
-            details.className = 'llm-life';
-            details.append(el('summary', '', String(entry.comment).replace(ARCHIVE_PREFIX, '')), el('pre', 'llm-life-content', entry.content || ''));
-            list.append(details);
+        const visible = summaries.filter(item => !needle || `${item.title}\n${item.summary}`.toLowerCase().includes(needle));
+        if (!visible.length) list.append(el('div', 'llm-empty', summaries.length ? '没有匹配的历代经历。' : '尚无已经死亡并完成换身的前世记录。'));
+        for (const item of visible) {
+            const card = el('article', 'llm-life-card');
+            card.append(el('div', 'llm-life-title', item.title), el('p', 'llm-life-summary', item.summary || '尚无经历摘要'));
+            list.append(card);
         }
     };
     search.addEventListener('input', draw);
-    panel.append(el('div', 'llm-muted', name ? `世界书：${name}` : '尚未选择世界书'), search, list);
+    const state = getPath(statData, '主角.换身状态', {});
+    panel.append(el('div', 'llm-muted', '每次确认换身后，这里按世代显示上一具身体的简要经历。'));
+    if (state?.待归档人生词条 && state?.归档写入状态 === '待写入世界书') {
+        panel.append(createButton('把待归档前世写入世界书', archivePendingLife, 'menu_button llm-primary'));
+    }
+    panel.append(search, list);
     draw();
 }
 
@@ -365,7 +288,7 @@ function renderSettings(panel) {
     select.addEventListener('change', () => { settings().worldBookName = select.value; saveSettings(); render(); });
     const active = el('div', 'llm-muted', `当前目标：${currentWorldBookName() || '未找到'}`);
     const safety = el('div', 'llm-safety');
-    safety.textContent = '插件只读取 stat_data；人物卡须手动选择；确认口令只填入不发送；归档只追加到已有世界书；同名异文会停止。';
+    safety.textContent = '插件自动识别正文中已由你确认的新身体，不处理候选，也不会替你发送确认口令；归档只追加到已有世界书，同名异文会停止。';
     panel.append(label, select, active, safety, createButton('导出完整备份', exportBackup, 'menu_button llm-primary'));
 }
 
@@ -377,14 +300,14 @@ function createPanel() {
     header.append(el('b', '', '🗂️ 历代人生管理器'), el('div', 'inline-drawer-icon fa-solid fa-circle-chevron-down down'));
     const body = el('div', 'inline-drawer-content');
     const tabs = el('div', 'llm-tabs');
-    for (const [id, label] of [['current', '当前身体'], ['switch', '换身候选'], ['lives', '历代人生'], ['settings', '设置与备份']]) {
+    for (const [id, label] of [['current', '当前身体'], ['lives', '历代人生'], ['settings', '设置与备份']]) {
         const button = createButton(label, () => activateTab(id), 'menu_button llm-tab');
         button.dataset.tab = id;
         tabs.append(button);
     }
     const content = el('div', 'llm-panel');
     content.dataset.activeTab = 'current';
-    body.append(el('p', 'llm-help', '查看当前身体、管理换身候选，并把待归档前世安全写入同一本世界书。'), tabs, content);
+    body.append(el('p', 'llm-help', '自动识别正文中已确认的当前身体，并按世代汇总已经结束的人生。'), tabs, content);
     drawer.append(header, body);
     root.append(drawer);
     return root;
@@ -400,7 +323,9 @@ async function render() {
     const root = document.getElementById('legacy-life-manager-root');
     if (!root) return;
     const panel = root.querySelector('.llm-panel');
-    const tab = panel.dataset.activeTab || 'current';
+    const requestedTab = panel.dataset.activeTab || 'current';
+    const tab = ['current', 'lives', 'settings'].includes(requestedTab) ? requestedTab : 'current';
+    panel.dataset.activeTab = tab;
     for (const button of root.querySelectorAll('.llm-tab')) button.classList.toggle('active', button.dataset.tab === tab);
     panel.replaceChildren();
     if (!activeChat()) {
@@ -409,12 +334,10 @@ async function render() {
     }
     const statData = readStatData();
     if (!Object.keys(asObject(statData)).length) {
-        panel.append(el('div', 'llm-warning', '没有检测到 stat_data。请确认当前聊天已产生 MVU 变量，并启用酒馆助手/MVU。'));
-        if (tab !== 'settings') return;
+        panel.append(el('div', 'llm-warning', '没有检测到 stat_data；身份与历代人生仍会尝试从已确认的正文人物卡读取。'));
     }
     capturePendingSnapshot(statData);
     if (tab === 'current') renderCurrent(panel, statData);
-    if (tab === 'switch') renderSwitch(panel, statData);
     if (tab === 'lives') await renderLives(panel, statData);
     if (tab === 'settings') renderSettings(panel);
 }
@@ -439,7 +362,7 @@ export async function init() {
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
     registerEvents();
     await render();
-    console.log('[历代人生管理器] v0.1.2 已加载');
+    console.log('[历代人生管理器] v0.1.4 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

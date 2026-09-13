@@ -45,32 +45,41 @@ function resourceMaximum(resource) {
     return (Number.isFinite(base) ? base : 0) + (Number.isFinite(extra) ? extra : 0);
 }
 
-export function currentBodySummary(statData = {}, supplementalProfile = {}) {
+export function currentBodySummary(statData = {}, supplementalProfile = {}, options = {}) {
     const main = asObject(statData?.主角);
     const profile = asObject(main.载体档案);
     const supplemental = asObject(supplementalProfile);
     const hasCarrierProfile = Object.keys(profile).length > 0;
+    const preferSupplemental = options?.preferSupplemental === true;
+    const profileMatchesSupplemental = !preferSupplemental
+        || !profile.姓名
+        || !supplemental.姓名
+        || String(profile.姓名).trim() === String(supplemental.姓名).trim();
+    const liveProfile = profileMatchesSupplemental ? profile : {};
     const hp = asObject(main.生命值);
     const effects = Object.keys(asObject(main.状态效果));
-    let health = profile.伤病与健康;
+    let health = liveProfile.伤病与健康;
     if (!health && (hp.当前 != null || resourceMaximum(hp) != null)) {
         const current = formatSummaryValue(hp.当前);
         const maximum = resourceMaximum(hp);
         health = `生命值 ${current}/${maximum ?? '当前变量未提供'}`;
         health += effects.length ? ` · 状态：${effects.join('、')}` : ' · 无状态效果';
     }
+    if (!health) health = supplemental.伤病与健康;
+    const identityFirst = preferSupplemental ? supplemental : liveProfile;
+    const identitySecond = preferSupplemental ? liveProfile : supplemental;
     return {
-        name: formatSummaryValue(profile.姓名 || main.姓名 || supplemental.姓名, '当前变量未提供姓名'),
+        name: formatSummaryValue(identityFirst.姓名 || identitySecond.姓名 || main.姓名, '当前变量未提供姓名'),
         main,
-        usedSupplementalProfile: !hasCarrierProfile && Object.keys(supplemental).length > 0,
+        usedSupplementalProfile: Object.keys(supplemental).length > 0 && (preferSupplemental || !hasCarrierProfile),
         rows: [
-            ['原主', formatSummaryValue(profile.原主姓名 || main.原主姓名 || supplemental.原主姓名)],
-            ['年龄', formatSummaryValue(profile.年龄 || main.年龄 || supplemental.年龄)],
-            ['性别', formatSummaryValue(profile.性别 || main.性别 || supplemental.性别)],
-            ['种族', formatSummaryValue(hasCarrierProfile ? main.种族 : (supplemental.种族 || main.种族))],
-            ['身份', formatSummaryValue(hasCarrierProfile ? main.身份 : (supplemental.身份 || main.身份), '暂无身份')],
-            ['职业', formatSummaryValue(hasCarrierProfile ? main.职业 : (supplemental.职业 || main.职业), '暂无职业')],
-            ['地点', formatSummaryValue(profile.当前地点与处境 || getPath(statData, '世界.地点') || supplemental.地点)],
+            ['原主', formatSummaryValue(identityFirst.原主姓名 || identitySecond.原主姓名 || main.原主姓名)],
+            ['年龄', formatSummaryValue(identityFirst.年龄 || identitySecond.年龄 || main.年龄)],
+            ['性别', formatSummaryValue(identityFirst.性别 || identitySecond.性别 || main.性别)],
+            ['种族', formatSummaryValue(preferSupplemental ? (supplemental.种族 || main.种族) : (hasCarrierProfile ? main.种族 : (supplemental.种族 || main.种族)))],
+            ['身份', formatSummaryValue(preferSupplemental ? (supplemental.身份 || main.身份) : (hasCarrierProfile ? main.身份 : (supplemental.身份 || main.身份)), '暂无身份')],
+            ['职业', formatSummaryValue(preferSupplemental ? (supplemental.职业 || main.职业) : (hasCarrierProfile ? main.职业 : (supplemental.职业 || main.职业)), '暂无职业')],
+            ['地点', formatSummaryValue(liveProfile.当前地点与处境 || getPath(statData, '世界.地点') || supplemental.地点)],
             ['健康', formatSummaryValue(health)],
         ],
     };
@@ -183,6 +192,141 @@ export function supplementalPlayerProfile(messages = [], statData = {}) {
     }
 
     return { ...opening, ...matched };
+}
+
+function decodeHtmlText(value) {
+    return String(value || '')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/div\s*>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/&amp;/gi, '&')
+        .replace(/[ \t]+/g, ' ')
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+export function extractCarrierCards(text) {
+    const source = String(text || '');
+    return [...source.matchAll(/【当前载体人物设定开始】([\s\S]*?)【当前载体人物设定结束】/g)]
+        .map(match => match[1]?.trim())
+        .filter(Boolean);
+}
+
+function carrierField(card, label) {
+    const escaped = String(label).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const htmlMatch = String(card || '').match(new RegExp(`<b>\\s*${escaped}\\s*[：:]\\s*</b>\\s*([\\s\\S]*?)(?=<br\\s*\\/?>|<\\/div>)`, 'i'));
+    if (htmlMatch) return decodeHtmlText(htmlMatch[1]);
+    const text = decodeHtmlText(card);
+    return cleanInlineCardValue(text.match(new RegExp(`^\\s*${escaped}\\s*[：:]\\s*(.+)$`, 'm'))?.[1]);
+}
+
+export function parseCarrierCard(card) {
+    const name = carrierField(card, '姓名');
+    if (!name) return {};
+    const identityOccupation = carrierField(card, '身份职业');
+    const socialStatus = carrierField(card, '社会地位').split(/[。；;]/)[0].trim();
+    return {
+        姓名: name,
+        原主姓名: name,
+        ...(carrierField(card, '年龄') ? { 年龄: carrierField(card, '年龄') } : {}),
+        ...(carrierField(card, '性别') ? { 性别: carrierField(card, '性别') } : {}),
+        ...(carrierField(card, '种族') ? { 种族: carrierField(card, '种族') } : {}),
+        ...(socialStatus || identityOccupation ? { 身份: socialStatus || identityOccupation } : {}),
+        ...(identityOccupation ? { 职业: identityOccupation } : {}),
+        ...(carrierField(card, '当前地点') ? { 地点: carrierField(card, '当前地点') } : {}),
+        ...(carrierField(card, '接管瞬间处境与健康') ? { 伤病与健康: carrierField(card, '接管瞬间处境与健康') } : {}),
+    };
+}
+
+export function confirmedCarrierRecords(messages = []) {
+    const records = [];
+    for (let index = 0; index < messages.length; index += 1) {
+        const confirmation = messages[index];
+        if (!confirmation?.is_user || confirmation?.is_system || String(confirmation.mes || '').trim() !== '确认换身') continue;
+        for (let cardIndex = index - 1; cardIndex >= 0; cardIndex -= 1) {
+            const message = messages[cardIndex];
+            if (message?.is_user && String(message.mes || '').trim() === '确认换身') break;
+            if (!message || message.is_user || message.is_system) continue;
+            const cards = extractCarrierCards(message.mes);
+            const card = cards.at(-1);
+            const profile = parseCarrierCard(card);
+            if (!Object.keys(profile).length) continue;
+            records.push({ profile, card, confirmationIndex: index, cardIndex });
+            break;
+        }
+    }
+    return records;
+}
+
+export function confirmedCarrierProfile(messages = []) {
+    return confirmedCarrierRecords(messages).at(-1)?.profile || {};
+}
+
+export function lifeSummariesFromCarrierCard(card) {
+    const text = decodeHtmlText(card);
+    const section = text.match(/历代经历记忆[：:]\s*([\s\S]*?)(?=上一具身体死亡信息[：:]|※\s*历代旧人格|$)/)?.[1] || '';
+    const summaries = [];
+    for (const line of section.split('\n')) {
+        const match = line.trim().match(/^[·•\-]?\s*第\s*(\d+)\s*世[：:]\s*(.+?)(?:——|--|—)\s*(.+)$/);
+        if (!match) continue;
+        summaries.push({
+            generation: Number(match[1]),
+            name: match[2].trim(),
+            title: `第${match[1]}世·${match[2].trim()}`,
+            summary: match[3].trim(),
+            source: 'confirmed-card',
+        });
+    }
+    return summaries;
+}
+
+function summaryFromIndex(item) {
+    if (!item || typeof item !== 'object') return null;
+    const generation = Number(item.世代编号);
+    const name = String(item.身体姓名 || item.姓名 || '').trim();
+    if (!Number.isFinite(generation) || !name) return null;
+    const parts = [item.身份, item.所处时期, item.最重要经历, item.死亡原因]
+        .map(value => formatSummaryValue(value, ''))
+        .filter(Boolean);
+    return { generation, name, title: `第${generation}世·${name}`, summary: parts.join('；'), source: 'stat-data' };
+}
+
+function summaryFromArchiveEntry(entry) {
+    const title = String(entry?.comment || '').replace(ARCHIVE_PREFIX, '').trim();
+    const titleMatch = title.match(/^第\s*(\d+)\s*世[·・\-—:]\s*(.+)$/);
+    if (!titleMatch || entry?.disable) return null;
+    const text = decodeHtmlText(entry.content);
+    const important = text.match(/重要事件[：:]\s*([\s\S]*?)(?=重要人物|关键人物|死亡信息|死亡原因|未解决事项|$)/)?.[1]?.trim();
+    const death = text.match(/死亡原因[：:]\s*([^\n]+)/)?.[1]?.trim();
+    const summary = [important, death && `死亡原因：${death}`].filter(Boolean).join('；').replace(/\n+/g, ' ').slice(0, 900);
+    return {
+        generation: Number(titleMatch[1]),
+        name: titleMatch[2].trim(),
+        title: `第${titleMatch[1]}世·${titleMatch[2].trim()}`,
+        summary: summary || text.slice(0, 900),
+        source: 'world-book',
+    };
+}
+
+export function lifeHistorySummaries(messages = [], statData = {}, archiveEntries = []) {
+    const collected = new Map();
+    const put = item => {
+        if (!item) return;
+        const key = Number.isFinite(item.generation) ? `generation:${item.generation}` : item.title;
+        const previous = collected.get(key);
+        if (!previous || String(item.summary || '').length >= String(previous.summary || '').length) collected.set(key, item);
+    };
+    const index = Array.isArray(statData?.历代记忆摘要) ? statData.历代记忆摘要 : [];
+    index.map(summaryFromIndex).forEach(put);
+    archiveEntries.map(summaryFromArchiveEntry).forEach(put);
+    for (const record of confirmedCarrierRecords(messages)) lifeSummariesFromCarrierCard(record.card).forEach(put);
+    return [...collected.values()].sort((a, b) => (a.generation || 0) - (b.generation || 0));
 }
 
 export function archiveTitle(draft, statData = {}) {
