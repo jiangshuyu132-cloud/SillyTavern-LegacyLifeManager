@@ -211,6 +211,36 @@ function decodeHtmlText(value) {
         .trim();
 }
 
+export function carrierCardText(card) {
+    return decodeHtmlText(card)
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+export function carrierCardSections(card) {
+    const text = carrierCardText(card);
+    if (!text) return [];
+    const headings = [...text.matchAll(/^\s*[—-]\s*([^\n—-]{2,40}?)\s*[—-]\s*$/gm)];
+    if (!headings.length) return [{ title: '完整人物资料', content: text }];
+    const sections = [];
+    const preamble = text.slice(0, headings[0].index).trim();
+    if (preamble) sections.push({ title: '人物卡说明', content: preamble });
+    for (let index = 0; index < headings.length; index += 1) {
+        const start = headings[index].index + headings[index][0].length;
+        const end = headings[index + 1]?.index ?? text.length;
+        const content = text.slice(start, end).trim();
+        if (content) sections.push({ title: headings[index][1].trim(), content });
+    }
+    return sections;
+}
+
+export function isCarrierConfirmation(value) {
+    const text = String(value || '').trim();
+    if (text === '确认换身') return true;
+    return /^发送\s*["“']确认换身["”']\s*[，,、。:]\s*正式接管[^\n]{0,160}$/u.test(text);
+}
+
 export function extractCarrierCards(text) {
     const source = String(text || '');
     return [...source.matchAll(/【当前载体人物设定开始】([\s\S]*?)【当前载体人物设定结束】/g)]
@@ -229,7 +259,8 @@ function carrierField(card, label) {
 export function parseCarrierCard(card) {
     const name = carrierField(card, '姓名');
     if (!name) return {};
-    const identityOccupation = carrierField(card, '身份职业');
+    const identityOccupation = carrierField(card, '身份职业') || carrierField(card, '职业');
+    const identity = carrierField(card, '身份');
     const socialStatus = carrierField(card, '社会地位').split(/[。；;]/)[0].trim();
     return {
         姓名: name,
@@ -237,10 +268,11 @@ export function parseCarrierCard(card) {
         ...(carrierField(card, '年龄') ? { 年龄: carrierField(card, '年龄') } : {}),
         ...(carrierField(card, '性别') ? { 性别: carrierField(card, '性别') } : {}),
         ...(carrierField(card, '种族') ? { 种族: carrierField(card, '种族') } : {}),
-        ...(socialStatus || identityOccupation ? { 身份: socialStatus || identityOccupation } : {}),
+        ...(identity || socialStatus || identityOccupation ? { 身份: identity || socialStatus || identityOccupation } : {}),
         ...(identityOccupation ? { 职业: identityOccupation } : {}),
         ...(carrierField(card, '当前地点') ? { 地点: carrierField(card, '当前地点') } : {}),
-        ...(carrierField(card, '接管瞬间处境与健康') ? { 伤病与健康: carrierField(card, '接管瞬间处境与健康') } : {}),
+        ...((carrierField(card, '接管瞬间处境与健康') || carrierField(card, '健康'))
+            ? { 伤病与健康: carrierField(card, '接管瞬间处境与健康') || carrierField(card, '健康') } : {}),
     };
 }
 
@@ -248,10 +280,10 @@ export function confirmedCarrierRecords(messages = []) {
     const records = [];
     for (let index = 0; index < messages.length; index += 1) {
         const confirmation = messages[index];
-        if (!confirmation?.is_user || confirmation?.is_system || String(confirmation.mes || '').trim() !== '确认换身') continue;
+        if (!confirmation?.is_user || confirmation?.is_system || !isCarrierConfirmation(confirmation.mes)) continue;
         for (let cardIndex = index - 1; cardIndex >= 0; cardIndex -= 1) {
             const message = messages[cardIndex];
-            if (message?.is_user && String(message.mes || '').trim() === '确认换身') break;
+            if (message?.is_user && isCarrierConfirmation(message.mes)) break;
             if (!message || message.is_user || message.is_system) continue;
             const cards = extractCarrierCards(message.mes);
             const card = cards.at(-1);
@@ -264,16 +296,59 @@ export function confirmedCarrierRecords(messages = []) {
     return records;
 }
 
+export function responseSummaries(messages = [], startIndex = 0, endIndex = messages.length - 1) {
+    const summaries = [];
+    const seen = new Set();
+    for (let index = Math.max(0, startIndex); index <= Math.min(endIndex, messages.length - 1); index += 1) {
+        const message = messages[index];
+        if (!message || message.is_user || message.is_system) continue;
+        for (const match of String(message.mes || '').matchAll(/<summary\b[^>]*>([\s\S]*?)<\/summary>/gi)) {
+            const text = carrierCardText(match[1]).replace(/\s+/g, ' ').trim();
+            if (!text || seen.has(text)) continue;
+            seen.add(text);
+            summaries.push({ messageIndex: index, text });
+        }
+    }
+    return summaries;
+}
+
+export function inferredLivesFromCarrierCard(card) {
+    return lifeSummariesFromCarrierCard(card).map(item => ({
+        ...item,
+        archivedAt: null,
+        source: 'imported-card',
+    }));
+}
+
+export function buildLifeRecord(currentBody, messages = [], endIndex = messages.length - 1) {
+    const profile = asObject(currentBody?.profile);
+    const generation = Number(currentBody?.generation) || 1;
+    const name = String(profile.姓名 || profile.原主姓名 || '未命名').trim();
+    const summaries = responseSummaries(messages, Number(currentBody?.startMessageIndex || 0), endIndex);
+    const combined = summaries.map(item => item.text).join('；').slice(0, 4000);
+    return {
+        generation,
+        name,
+        title: `第${generation}世·${name}`,
+        summary: combined || `${name}这一世已经结束，暂无可提取的正文摘要。`,
+        rawCard: String(currentBody?.rawCard || ''),
+        startMessageIndex: Number(currentBody?.startMessageIndex || 0),
+        endMessageIndex: Math.max(0, Number(endIndex || 0)),
+        archivedAt: new Date().toISOString(),
+        source: 'plugin-ledger',
+    };
+}
+
 export function confirmedCarrierProfile(messages = []) {
     return confirmedCarrierRecords(messages).at(-1)?.profile || {};
 }
 
 export function lifeSummariesFromCarrierCard(card) {
     const text = decodeHtmlText(card);
-    const section = text.match(/历代经历记忆[：:]\s*([\s\S]*?)(?=上一具身体死亡信息[：:]|※\s*历代旧人格|$)/)?.[1] || '';
+    const section = text.match(/历代经历记忆(?:简短索引)?[：:]\s*([\s\S]*?)(?=上一具身体死亡信息[：:]|※\s*历代旧人格|$)/)?.[1] || '';
     const summaries = [];
     for (const line of section.split('\n')) {
-        const match = line.trim().match(/^[·•\-]?\s*第\s*(\d+)\s*世[：:]\s*(.+?)(?:——|--|—)\s*(.+)$/);
+        const match = line.trim().match(/^[·•\-]?\s*第\s*(\d+)\s*世[：:·・]\s*(.+?)\s*(?:——|--|—)\s*(.+)$/);
         if (!match) continue;
         summaries.push({
             generation: Number(match[1]),
@@ -314,7 +389,7 @@ function summaryFromArchiveEntry(entry) {
     };
 }
 
-export function lifeHistorySummaries(messages = [], statData = {}, archiveEntries = []) {
+export function lifeHistorySummaries(messages = [], statData = {}, archiveEntries = [], localLives = []) {
     const collected = new Map();
     const put = item => {
         if (!item) return;
@@ -326,6 +401,14 @@ export function lifeHistorySummaries(messages = [], statData = {}, archiveEntrie
     index.map(summaryFromIndex).forEach(put);
     archiveEntries.map(summaryFromArchiveEntry).forEach(put);
     for (const record of confirmedCarrierRecords(messages)) lifeSummariesFromCarrierCard(record.card).forEach(put);
+    localLives.forEach(item => put(item && {
+        generation: Number(item.generation),
+        name: String(item.name || '').trim(),
+        title: item.title || `第${item.generation}世·${item.name}`,
+        summary: String(item.summary || '').trim(),
+        source: item.source || 'plugin-ledger',
+        ...item,
+    }));
     return [...collected.values()].sort((a, b) => (a.generation || 0) - (b.generation || 0));
 }
 

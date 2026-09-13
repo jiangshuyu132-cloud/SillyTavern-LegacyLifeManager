@@ -39,6 +39,7 @@ export function statDataFromVariables(variables) {
 
 export function statDataFromMessage(message) {
     const candidates = [
+        Array.isArray(message?.variables) ? message.variables.at(-1)?.stat_data : null,
         message?.variables?.stat_data,
         message?.extra?.variables?.stat_data,
         message?.extra?.stat_data,

@@ -3,12 +3,19 @@ import {
     archiveKeywords,
     archiveTitle,
     asObject,
+    buildLifeRecord,
+    carrierCardSections,
+    carrierCardText,
     confirmedCarrierProfile,
+    confirmedCarrierRecords,
     currentBodySummary,
     detectCarryover,
+    extractCarrierCards,
     getPath,
+    inferredLivesFromCarrierCard,
     lifeHistorySummaries,
     normalizeEntries,
+    parseCarrierCard,
     safeFilename,
     supplementalPlayerProfile,
     upsertArchive,
@@ -17,8 +24,10 @@ import { createMvuAdapter } from './mvu-adapter.js';
 
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 1 });
+const PROMPT_KEY = 'legacy_life_manager_current_body';
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 2, injectionMode: 'full' });
 let initialized = false;
+let refreshTimers = [];
 
 function context() {
     return globalThis.SillyTavern?.getContext?.();
@@ -35,9 +44,16 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 1, pendingSnapshot: null, backups: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 2, currentBody: null, lives: [], pendingSnapshot: null, backups: [] };
     }
-    return ctx.chatMetadata[METADATA_KEY] || null;
+    const data = ctx.chatMetadata[METADATA_KEY] || null;
+    if (data) {
+        data.version = 2;
+        data.lives ??= [];
+        data.currentBody ??= null;
+        data.backups ??= [];
+    }
+    return data;
 }
 
 function notify(level, message) {
@@ -67,6 +83,98 @@ function latestMessageIndex() {
 const mvu = createMvuAdapter({ env: globalThis, getContext: context, getLatestMessageIndex: latestMessageIndex });
 const readStatData = () => mvu.readStatData();
 const writeMessagePath = (path, value) => mvu.writeMessagePath(path, value);
+
+function mergeLives(data, incoming) {
+    const byGeneration = new Map((data.lives || []).map(item => [Number(item.generation), item]));
+    for (const item of incoming || []) {
+        if (!Number.isFinite(Number(item?.generation)) || !item?.name) continue;
+        const generation = Number(item.generation);
+        const previous = byGeneration.get(generation);
+        if (!previous || String(item.summary || '').length > String(previous.summary || '').length) byGeneration.set(generation, item);
+    }
+    data.lives = [...byGeneration.values()].sort((a, b) => Number(a.generation) - Number(b.generation));
+}
+
+function generationFromCard(card, fallback = 1) {
+    const text = carrierCardText(card);
+    const arabic = text.match(/世代(?:编号)?[：:]\s*第?\s*(\d+)\s*世/);
+    if (arabic) return Number(arabic[1]);
+    const chinese = text.match(/世代(?:编号)?[：:]\s*第?\s*([一二三四五六七八九十]+)\s*世/);
+    const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+    return chinese ? (digits[chinese[1]] || fallback) : fallback;
+}
+
+function saveImportedBody(card, profile, messageIndex, mode = 'sync') {
+    const data = chatData();
+    const messages = context()?.chat || [];
+    const previous = data.currentBody;
+    const inferred = inferredLivesFromCarrierCard(card);
+    mergeLives(data, inferred);
+    const generation = generationFromCard(card, Math.max(1, ...data.lives.map(item => Number(item.generation) + 1).filter(Number.isFinite)));
+    if (mode === 'confirm' && previous && previous.profile?.姓名 !== profile.姓名) {
+        mergeLives(data, [buildLifeRecord(previous, messages, Math.max(0, messageIndex - 1))]);
+    }
+    data.currentBody = {
+        profile,
+        rawCard: card,
+        text: carrierCardText(card),
+        sections: carrierCardSections(card),
+        sourceMessageIndex: messageIndex,
+        startMessageIndex: mode === 'confirm' ? messageIndex : (previous?.startMessageIndex ?? messageIndex),
+        generation,
+        confirmed: mode === 'confirm' || previous?.confirmed === true,
+        importedAt: new Date().toISOString(),
+    };
+    saveChatMetadata();
+    updateCurrentBodyPrompt();
+    return data.currentBody;
+}
+
+function syncDetectedConversation() {
+    const ctx = context();
+    const data = chatData();
+    const record = confirmedCarrierRecords(ctx?.chat || []).at(-1);
+    if (!record || data.currentBody?.sourceMessageIndex === record.cardIndex) return false;
+    saveImportedBody(record.card, record.profile, record.cardIndex, 'confirm');
+    return true;
+}
+
+function currentImportedBody() {
+    return chatData(false)?.currentBody || null;
+}
+
+function dynamicContextText(statData) {
+    const main = asObject(statData?.主角);
+    return JSON.stringify({
+        当前地点: getPath(statData, '世界.地点', ''),
+        种族: main.种族,
+        身份: main.身份,
+        职业: main.职业,
+        等级: main.等级,
+        属性: main.属性,
+        生命值: main.生命值,
+        法力值: main.法力值,
+        体力值: main.体力值,
+        状态效果: main.状态效果,
+        当前穿着: main.载体档案?.当前穿着,
+        当前处境: main.载体档案?.当前地点与处境,
+        伤病与健康: main.载体档案?.伤病与健康,
+    }, null, 2);
+}
+
+function buildCurrentBodyPrompt(body, statData, mode) {
+    if (!body || mode === 'off') return '';
+    const profile = JSON.stringify(body.profile || {}, null, 2);
+    const details = mode === 'full' ? body.text : profile;
+    return `<legacy_life_current_body>\n这是已经由现实Participant确认并由“历代人生管理器”保存的当前身体档案。它是当前人物设定，不是候选，也不是前世。不得把历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性混入当前身体；不得据此代替Participant生成台词、内心、动作、决定或选择。地点、资源、伤势、状态与穿着等易变信息，以“最新动态”优先。\n\n【完整当前身体档案】\n${details}\n\n【最新动态】\n${dynamicContextText(statData)}\n</legacy_life_current_body>`;
+}
+
+async function updateCurrentBodyPrompt() {
+    const ctx = context();
+    if (typeof ctx?.setExtensionPrompt !== 'function') return;
+    const prompt = buildCurrentBodyPrompt(currentImportedBody(), readStatData(), settings().injectionMode || 'full');
+    await ctx.setExtensionPrompt(PROMPT_KEY, prompt, 1, 0, false, 0);
+}
 
 function currentWorldBookName() {
     const ctx = context();
@@ -200,6 +308,45 @@ function pretty(value) {
     return JSON.stringify(value ?? null, null, 2);
 }
 
+function availableCarrierCards() {
+    const result = [];
+    for (const [messageIndex, message] of (context()?.chat || []).entries()) {
+        if (!message || message.is_user || message.is_system) continue;
+        const cards = extractCarrierCards(message.mes);
+        for (const [cardIndex, card] of cards.entries()) {
+            const profile = parseCarrierCard(card);
+            if (profile.姓名) result.push({ messageIndex, cardIndex, card, profile });
+        }
+    }
+    return result;
+}
+
+function importSelectedCard(record, mode) {
+    if (!record) return notify('warning', '没有选择可导入的人物卡');
+    const verb = mode === 'confirm' ? '确认换身并导入' : '同步为当前身体';
+    if (!globalThis.confirm(`${verb}“${record.profile.姓名}”？\n\n人物卡完整原文会保存到当前聊天；${mode === 'confirm' ? '旧身体会进入历代人生。' : '不会新增历代人生。'}`)) return;
+    saveImportedBody(record.card, record.profile, record.messageIndex, mode);
+    notify('success', `已${verb}：${record.profile.姓名}`);
+    render();
+}
+
+function renderFullBody(panel, body) {
+    if (!body?.text) return;
+    const heading = el('h3', '', '完整当前身体档案');
+    const intro = el('div', 'llm-muted', '界面按板块展示，插件仍保存完整人物卡原文；AI 注入不受板块展开状态影响。');
+    const sections = el('div', 'llm-sections');
+    for (const section of body.sections || carrierCardSections(body.rawCard)) {
+        const details = document.createElement('details');
+        details.className = 'llm-life llm-section';
+        details.append(el('summary', '', section.title), el('div', 'llm-section-content', section.content));
+        sections.append(details);
+    }
+    const raw = document.createElement('details');
+    raw.className = 'llm-life';
+    raw.append(el('summary', '', '查看完整原始人物卡文本'), el('pre', 'llm-json', body.text));
+    panel.append(heading, intro, sections, raw);
+}
+
 function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -209,10 +356,13 @@ function el(tag, className, text) {
 
 function renderCurrent(panel, statData) {
     const messages = context()?.chat || [];
+    const importedBody = currentImportedBody();
     const confirmedProfile = confirmedCarrierProfile(messages);
+    const importedProfile = asObject(importedBody?.profile);
+    const hasImportedProfile = Object.keys(importedProfile).length > 0;
     const hasConfirmedProfile = Object.keys(confirmedProfile).length > 0;
-    const chatProfile = hasConfirmedProfile ? confirmedProfile : supplementalPlayerProfile(messages, statData);
-    const summary = currentBodySummary(statData, chatProfile, { preferSupplemental: hasConfirmedProfile });
+    const chatProfile = hasImportedProfile ? importedProfile : hasConfirmedProfile ? confirmedProfile : supplementalPlayerProfile(messages, statData);
+    const summary = currentBodySummary(statData, chatProfile, { preferSupplemental: hasImportedProfile || hasConfirmedProfile });
     const main = summary.main;
     const header = el('div', 'llm-card-head');
     header.append(el('div', 'llm-avatar', '◈'), el('div', '', summary.name));
@@ -227,7 +377,9 @@ function renderCurrent(panel, statData) {
     const warnings = carryoverWarnings(statData);
     panel.append(header, grid);
     if (summary.usedSupplementalProfile) {
-        panel.append(el('div', 'llm-muted', hasConfirmedProfile
+        panel.append(el('div', 'llm-muted', hasImportedProfile
+            ? '完整身份资料来自插件保存的当前人物卡；地点、资源与状态读取最新 stat_data。'
+            : hasConfirmedProfile
             ? '当前身份来自最近一次已确认换身的人物卡；地点、生命值与状态读取最新 stat_data。'
             : '人物资料来自当前聊天的人物卡；地点、生命值与状态读取最新 stat_data。'));
     }
@@ -237,13 +389,14 @@ function renderCurrent(panel, statData) {
         panel.append(warning);
     }
     panel.append(details);
+    renderFullBody(panel, importedBody);
 }
 
 async function renderLives(panel, statData) {
     const name = currentWorldBookName();
     const book = name ? await context()?.loadWorldInfo?.(name) : null;
     const entries = book ? Object.values(normalizeEntries(book)) : [];
-    const summaries = lifeHistorySummaries(context()?.chat || [], statData, entries);
+    const summaries = lifeHistorySummaries(context()?.chat || [], statData, entries, chatData(false)?.lives || []);
     const search = document.createElement('input');
     search.className = 'text_pole';
     search.placeholder = '搜索姓名或经历';
@@ -256,6 +409,11 @@ async function renderLives(panel, statData) {
         for (const item of visible) {
             const card = el('article', 'llm-life-card');
             card.append(el('div', 'llm-life-title', item.title), el('p', 'llm-life-summary', item.summary || '尚无经历摘要'));
+            if (item.rawCard) {
+                const details = document.createElement('details');
+                details.append(el('summary', '', '查看该世人物卡'), el('pre', 'llm-life-content', carrierCardText(item.rawCard)));
+                card.append(details);
+            }
             list.append(card);
         }
     };
@@ -287,9 +445,54 @@ function renderSettings(panel) {
     }
     select.addEventListener('change', () => { settings().worldBookName = select.value; saveSettings(); render(); });
     const active = el('div', 'llm-muted', `当前目标：${currentWorldBookName() || '未找到'}`);
+    const injectionLabel = el('label', 'llm-label', '发送给 AI 的当前身体资料');
+    const injection = document.createElement('select');
+    injection.className = 'text_pole';
+    for (const [value, text] of [['full', '完整注入（推荐）'], ['compact', '精简注入'], ['off', '不注入']]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        option.selected = (settings().injectionMode || 'full') === value;
+        injection.append(option);
+    }
+    injection.addEventListener('change', () => {
+        settings().injectionMode = injection.value;
+        saveSettings();
+        updateCurrentBodyPrompt();
+    });
+    injectionLabel.append(injection);
+
+    const importLabel = el('label', 'llm-label', '从正文选择人物卡');
+    const cardSelect = document.createElement('select');
+    cardSelect.className = 'text_pole';
+    const cards = availableCarrierCards();
+    if (!cards.length) {
+        const option = document.createElement('option');
+        option.textContent = '当前聊天没有识别到人物卡';
+        cardSelect.append(option);
+        cardSelect.disabled = true;
+    } else {
+        cards.slice().reverse().forEach((record, index) => {
+            const option = document.createElement('option');
+            option.value = String(cards.indexOf(record));
+            option.textContent = `第 ${record.messageIndex + 1} 楼 · ${record.profile.姓名}${index === 0 ? '（最近）' : ''}`;
+            cardSelect.append(option);
+        });
+    }
+    importLabel.append(cardSelect);
+    const importActions = el('div', 'llm-actions');
+    importActions.append(
+        createButton('同步为当前身体', () => importSelectedCard(cards[Number(cardSelect.value)], 'sync')),
+        createButton('确认换身并导入', () => importSelectedCard(cards[Number(cardSelect.value)], 'confirm'), 'menu_button llm-primary'),
+    );
+    const repair = createButton('扫描并修复本聊天', () => {
+        const record = confirmedCarrierRecords(context()?.chat || []).at(-1);
+        if (!record) return notify('warning', '未找到人物卡与确认换身记录；可从上方手动选择人物卡');
+        importSelectedCard({ messageIndex: record.cardIndex, card: record.card, profile: record.profile }, 'confirm');
+    });
     const safety = el('div', 'llm-safety');
     safety.textContent = '插件自动识别正文中已由你确认的新身体，不处理候选，也不会替你发送确认口令；归档只追加到已有世界书，同名异文会停止。';
-    panel.append(label, select, active, safety, createButton('导出完整备份', exportBackup, 'menu_button llm-primary'));
+    panel.append(label, select, active, injectionLabel, importLabel, importActions, repair, safety, createButton('导出完整备份', exportBackup, 'menu_button llm-primary'));
 }
 
 function createPanel() {
@@ -336,18 +539,49 @@ async function render() {
     if (!Object.keys(asObject(statData)).length) {
         panel.append(el('div', 'llm-warning', '没有检测到 stat_data；身份与历代人生仍会尝试从已确认的正文人物卡读取。'));
     }
+    syncDetectedConversation();
     capturePendingSnapshot(statData);
     if (tab === 'current') renderCurrent(panel, statData);
     if (tab === 'lives') await renderLives(panel, statData);
     if (tab === 'settings') renderSettings(panel);
 }
 
+function installCardButtons() {
+    const ctx = context();
+    if (!Array.isArray(ctx?.chat)) return;
+    for (const message of document.querySelectorAll('#chat .mes[mesid], #chat .mes[data-message-id]')) {
+        const messageIndex = Number(message.getAttribute('mesid') ?? message.dataset.messageId);
+        if (!Number.isFinite(messageIndex) || message.querySelector('.llm-card-actions')) continue;
+        const cards = extractCarrierCards(ctx.chat[messageIndex]?.mes);
+        const card = cards.at(-1);
+        const profile = parseCarrierCard(card);
+        if (!profile.姓名) continue;
+        const actions = el('div', 'llm-actions llm-card-actions');
+        actions.append(
+            createButton('导入为当前身体', () => importSelectedCard({ messageIndex, card, profile }, 'sync')),
+            createButton('确认换身并导入', () => importSelectedCard({ messageIndex, card, profile }, 'confirm'), 'menu_button llm-primary'),
+        );
+        (message.querySelector('.mes_text') || message.querySelector('.mes_block') || message).append(actions);
+    }
+}
+
+function scheduleRefresh() {
+    refreshTimers.forEach(clearTimeout);
+    refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(() => {
+        render().catch(error => console.error('[历代人生管理器] 渲染失败', error));
+        updateCurrentBodyPrompt().catch(error => console.error('[历代人生管理器] 注入失败', error));
+        installCardButtons();
+    }, delay));
+}
+
 function registerEvents() {
     const ctx = context();
     if (!ctx?.eventSource || !ctx?.eventTypes) return;
-    const refresh = () => render().catch(error => console.error('[历代人生管理器] 渲染失败', error));
     for (const type of ['CHAT_CHANGED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
-        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], refresh);
+        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], scheduleRefresh);
+    }
+    for (const type of ['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS']) {
+        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], updateCurrentBodyPrompt);
     }
 }
 
@@ -362,7 +596,12 @@ export async function init() {
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
     registerEvents();
     await render();
-    console.log('[历代人生管理器] v0.1.4 已加载');
+    installCardButtons();
+    await updateCurrentBodyPrompt();
+    const observer = new MutationObserver(() => installCardButtons());
+    const chat = document.querySelector('#chat');
+    if (chat) observer.observe(chat, { childList: true, subtree: true });
+    console.log('[历代人生管理器] v0.2.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
