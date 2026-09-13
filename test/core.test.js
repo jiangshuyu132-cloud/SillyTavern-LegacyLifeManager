@@ -4,16 +4,28 @@ import {
     archiveKeywords,
     archiveTitle,
     asObject,
+    buildLifeRecord,
+    carrierCardSections,
+    carrierCardText,
+    confirmedCarrierProfile,
+    confirmedCarrierRecords,
     currentBodySummary,
     detectCarryover,
+    extractCarrierCards,
     extractCharacterCard,
     extractCharacterCards,
     getPath,
     initialPlayerProfile,
+    inferredLivesFromCarrierCard,
+    isCarrierConfirmation,
+    lifeHistorySummaries,
+    lifeSummariesFromCarrierCard,
     normalizeEntries,
     normalizeStage,
     formatSummaryValue,
     safeFilename,
+    parseCarrierCard,
+    responseSummaries,
     supplementalPlayerProfile,
     upsertArchive,
 } from '../core.js';
@@ -62,6 +74,139 @@ test('supplementalPlayerProfile matches the player card instead of a newer NPC c
         姓名: '江书宇', 原主姓名: '江书宇', 身份: '无', 性别: '男', 年龄: '16岁',
         种族: '人类（异世界来客）', 职业: '无（原世界学生）',
     });
+});
+
+const carrierCard = `【当前载体人物设定开始】
+<div><b>世代编号：</b>第2世（若确认）<br>
+<b>姓名：</b>若莎·阿泽恩（Zhosha Adzern）<br>
+<b>性别：</b>女<br>
+<b>种族：</b>人类<br>
+<b>年龄：</b>15岁｜外貌年龄15岁<br>
+<b>身份职业：</b>铁炉堡裁缝铺学徒<br>
+<b>社会地位：</b>平民阶层。家境清贫但温饱无虞。<br>
+<b>当前地点：</b>铁炉堡工匠区裁缝铺二楼<br>
+<b>接管瞬间处境与健康：</b>身体健康，无伤病。<br>
+<b>历代经历记忆：</b><br>
+· 第1世：江书宇——从现代中国穿越到铁炉堡，次日被盗匪流矢射杀。<br>
+<b>上一具身体死亡信息：</b>箭矢贯穿头部，当场死亡。<br>
+<b>※ 历代旧人格均未继承。</b></div>
+【当前载体人物设定结束】`;
+
+test('parseCarrierCard reads the HTML carrier format used by the story', () => {
+    const [card] = extractCarrierCards(carrierCard);
+    assert.deepEqual(parseCarrierCard(card), {
+        姓名: '若莎·阿泽恩（Zhosha Adzern）',
+        原主姓名: '若莎·阿泽恩（Zhosha Adzern）',
+        年龄: '15岁｜外貌年龄15岁',
+        性别: '女',
+        种族: '人类',
+        身份: '平民阶层',
+        职业: '铁炉堡裁缝铺学徒',
+        地点: '铁炉堡工匠区裁缝铺二楼',
+        伤病与健康: '身体健康，无伤病。',
+    });
+});
+
+test('confirmedCarrierProfile uses only the latest card followed by exact confirmation', () => {
+    const messages = [
+        { is_user: false, mes: carrierCard },
+        { is_user: true, mes: '确认换身' },
+        { is_user: false, mes: carrierCard.replaceAll('若莎·阿泽恩（Zhosha Adzern）', '未确认的新候选') },
+    ];
+    assert.equal(confirmedCarrierRecords(messages).length, 1);
+    assert.equal(confirmedCarrierProfile(messages).姓名, '若莎·阿泽恩（Zhosha Adzern）');
+});
+
+test('confirmation recognizes the preset explanatory option without accepting discussion', () => {
+    assert.equal(isCarrierConfirmation('确认换身'), true);
+    assert.equal(isCarrierConfirmation('发送“确认换身”，正式接管朵丽的身体，开始第二世的生活'), true);
+    assert.equal(isCarrierConfirmation('我想问问“确认换身”是什么意思'), false);
+});
+
+test('confirmed carrier records accept the legacy explanatory option', () => {
+    const messages = [
+        { is_user: false, mes: carrierCard },
+        { is_user: true, mes: '发送"确认换身"，正式接管若莎的身体，开始第二世的生活' },
+    ];
+    assert.equal(confirmedCarrierProfile(messages).姓名, '若莎·阿泽恩（Zhosha Adzern）');
+});
+
+test('carrier card keeps complete text and splits display sections', () => {
+    const text = carrierCardText(extractCarrierCards(carrierCard)[0]);
+    assert.match(text, /历代经历记忆/);
+    const sections = carrierCardSections('<div>说明<br>— 当前形态基础 —<br>姓名：朵丽<br>— 外貌详述 —<br>棕发</div>');
+    assert.deepEqual(sections.map(item => item.title), ['人物卡说明', '当前形态基础', '外貌详述']);
+    assert.match(sections[2].content, /棕发/);
+});
+
+test('response summaries and life records preserve concise life experience', () => {
+    const messages = [
+        { is_user: false, mes: '<summary>抵达铁炉堡并被卫兵盘查。</summary>' },
+        { is_user: true, mes: '等待' },
+        { is_user: false, mes: '<summary>在城东被流矢射杀。</summary>' },
+    ];
+    assert.deepEqual(responseSummaries(messages).map(item => item.text), ['抵达铁炉堡并被卫兵盘查。', '在城东被流矢射杀。']);
+    const record = buildLifeRecord({ generation: 1, profile: { 姓名: '江书宇' }, startMessageIndex: 0 }, messages, 2);
+    assert.equal(record.title, '第1世·江书宇');
+    assert.match(record.summary, /流矢射杀/);
+});
+
+test('inferred lives recover history from an imported current-body card', () => {
+    const lives = inferredLivesFromCarrierCard(extractCarrierCards(carrierCard)[0]);
+    assert.equal(lives[0].title, '第1世·江书宇');
+    assert.equal(lives[0].source, 'imported-card');
+});
+
+test('actual v2 card variants preserve separate identity, occupation, health and legacy index', () => {
+    const card = `<div><b>姓名:</b> 朵丽<br><b>身份:</b> 驻军军需处洗衣工<br><b>职业:</b> 洗衣工、缝补工<br><b>健康:</b> 双手有裂口。<br><b>历代经历记忆简短索引:</b><br>· 第1世·江书宇 —— 抵达铁炉堡后被流矢射杀。<br><b>上一具身体死亡信息:</b> 已死亡</div>`;
+    assert.deepEqual(parseCarrierCard(card), {
+        姓名: '朵丽', 原主姓名: '朵丽', 身份: '驻军军需处洗衣工', 职业: '洗衣工、缝补工', 伤病与健康: '双手有裂口。',
+    });
+    assert.equal(lifeSummariesFromCarrierCard(card)[0].title, '第1世·江书宇');
+});
+
+test('currentBodySummary lets a confirmed carrier override stale identity but keeps live status', () => {
+    const confirmed = parseCarrierCard(extractCarrierCards(carrierCard)[0]);
+    const result = currentBodySummary({
+        主角: {
+            载体档案: { 姓名: '江书宇', 年龄: '16岁', 当前地点与处境: '旧地点' },
+            种族: '人类（异世界来客）', 身份: [], 职业: ['裁缝学徒'],
+            生命值: { 当前: 206, 上限: { _基础: 200, 额外: 13 } }, 状态效果: {},
+        },
+        世界: { 地点: '铁炉堡工匠区裁缝铺二楼' },
+    }, confirmed, { preferSupplemental: true });
+    const rows = Object.fromEntries(result.rows);
+    assert.equal(result.name, '若莎·阿泽恩（Zhosha Adzern）');
+    assert.equal(rows.年龄, '15岁｜外貌年龄15岁');
+    assert.equal(rows.性别, '女');
+    assert.equal(rows.职业, '铁炉堡裁缝铺学徒');
+    assert.equal(rows.地点, '铁炉堡工匠区裁缝铺二楼');
+    assert.equal(rows.健康, '生命值 206/213 · 无状态效果');
+});
+
+test('life history renders concise summaries and ignores protocol/template entries', () => {
+    assert.deepEqual(lifeSummariesFromCarrierCard(extractCarrierCards(carrierCard)[0]), [{
+        generation: 1,
+        name: '江书宇',
+        title: '第1世·江书宇',
+        summary: '从现代中国穿越到铁炉堡，次日被盗匪流矢射杀。',
+        source: 'confirmed-card',
+    }]);
+    const result = lifeHistorySummaries(
+        [{ is_user: false, mes: carrierCard }, { is_user: true, mes: '确认换身' }],
+        {},
+        [
+            { comment: '[历代记忆档案]【常驻规则】档案协议', content: '不是人生' },
+            { comment: '[历代记忆档案]【模板·默认禁用】', content: '不是人生' },
+        ],
+    );
+    assert.equal(result.length, 1);
+    assert.equal(result[0].title, '第1世·江书宇');
+});
+
+test('life history includes chat-local plugin ledger records', () => {
+    const result = lifeHistorySummaries([], {}, [], [{ generation: 2, name: '朵丽', title: '第2世·朵丽', summary: '在铁炉堡生活。' }]);
+    assert.equal(result[0].title, '第2世·朵丽');
 });
 
 test('archiveTitle parses explicit title', () => {
@@ -166,6 +311,7 @@ test('statDataFromVariables reads object and JSON forms', () => {
 
 test('statDataFromMessage supports SillyTavern storage fallbacks', () => {
     assert.deepEqual(statDataFromMessage({ extra: { variables: { stat_data: { 主角: { 等级: 4 } } } } }), { 主角: { 等级: 4 } });
+    assert.deepEqual(statDataFromMessage({ variables: [{ stat_data: { 主角: { 等级: 7 } } }] }), { 主角: { 等级: 7 } });
 });
 
 test('MVU adapter reads exact message floors through TavernHelper.getVariables', () => {
