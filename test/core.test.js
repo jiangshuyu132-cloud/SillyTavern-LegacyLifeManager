@@ -5,10 +5,13 @@ import {
     archiveTitle,
     asObject,
     buildLifeRecord,
+    carrierGeneration,
     carrierCardSections,
     carrierCardText,
+    carrierRecordKey,
     confirmedCarrierProfile,
     confirmedCarrierRecords,
+    conversationLedgerTruth,
     currentBodySummary,
     detectCarryover,
     extractCarrierCards,
@@ -20,12 +23,16 @@ import {
     isCarrierConfirmation,
     lifeHistorySummaries,
     lifeSummariesFromCarrierCard,
+    lifeSummariesFromUpdateVariable,
+    mergeLifeRecords,
     normalizeEntries,
     normalizeStage,
     formatSummaryValue,
     safeFilename,
     parseCarrierCard,
+    rebuildConversationLives,
     responseSummaries,
+    stableTextFingerprint,
     supplementalPlayerProfile,
     upsertArchive,
 } from '../core.js';
@@ -92,6 +99,17 @@ const carrierCard = `【当前载体人物设定开始】
 <b>※ 历代旧人格均未继承。</b></div>
 【当前载体人物设定结束】`;
 
+const actualCarrierCardVariant = `【当前载体人物设定开始】
+<div><b>世代编号：</b>第2世（待确认）<br>
+<b>姓名：</b>忒娜·厄尔伯<br>
+<b>性别：</b>女<br>
+<b>===== 历代经历记忆 =====</b><br>
+第1世·江书宇：来自异世界的年轻人，在铁炉堡存活不足一天。<br>
+死亡原因：流矢穿颅（箭从左太阳穴射入，右太阳穴穿出）。<br><br>
+<b>===== 不继承声明 =====</b><br>
+历代旧人格均未继承。</div>
+【当前载体人物设定结束】`;
+
 test('parseCarrierCard reads the HTML carrier format used by the story', () => {
     const [card] = extractCarrierCards(carrierCard);
     assert.deepEqual(parseCarrierCard(card), {
@@ -131,6 +149,49 @@ test('confirmed carrier records accept the legacy explanatory option', () => {
     assert.equal(confirmedCarrierProfile(messages).姓名, '若莎·阿泽恩（Zhosha Adzern）');
 });
 
+test('conversation ledger truth disappears when card and confirmation floors are deleted', () => {
+    const confirmed = [
+        { is_user: false, mes: carrierCard, send_date: 'card-1' },
+        { is_user: true, mes: '确认换身', send_date: 'confirm-1' },
+    ];
+    const truth = conversationLedgerTruth(confirmed);
+    assert.equal(truth.currentRecord.profile.姓名, '若莎·阿泽恩（Zhosha Adzern）');
+    assert.equal(truth.lives[0].title, '第1世·江书宇');
+
+    assert.deepEqual(conversationLedgerTruth([{ is_user: true, mes: '随机', send_date: 'reroll-1' }]), {
+        records: [],
+        currentRecord: null,
+        lives: [],
+    });
+});
+
+test('cleared confirmations stay suppressed without blocking a newly generated confirmation', () => {
+    const first = [
+        { is_user: false, mes: carrierCard, send_date: 'card-1' },
+        { is_user: true, mes: '确认换身', send_date: 'confirm-1' },
+    ];
+    const firstRecord = confirmedCarrierRecords(first)[0];
+    const suppressedKey = carrierRecordKey(firstRecord, first);
+    assert.equal(conversationLedgerTruth(first, [suppressedKey]).currentRecord, null);
+
+    const regenerated = [
+        { is_user: false, mes: carrierCard, send_date: 'card-2' },
+        { is_user: true, mes: '确认换身', send_date: 'confirm-2' },
+    ];
+    const regeneratedRecord = confirmedCarrierRecords(regenerated)[0];
+    assert.notEqual(suppressedKey, carrierRecordKey(regeneratedRecord, regenerated));
+    assert.ok(conversationLedgerTruth(regenerated, [suppressedKey]).currentRecord);
+});
+
+test('carrier fingerprints and generation parsing are deterministic', () => {
+    assert.equal(stableTextFingerprint(carrierCard), stableTextFingerprint(`\r${carrierCard}\r`));
+    assert.equal(carrierGeneration(extractCarrierCards(carrierCard)[0]), 2);
+    assert.equal(rebuildConversationLives([
+        { is_user: false, mes: carrierCard },
+        { is_user: true, mes: '确认换身' },
+    ])[0].name, '江书宇');
+});
+
 test('carrier card keeps complete text and splits display sections', () => {
     const text = carrierCardText(extractCarrierCards(carrierCard)[0]);
     assert.match(text, /历代经历记忆/);
@@ -163,6 +224,49 @@ test('actual v2 card variants preserve separate identity, occupation, health and
         姓名: '朵丽', 原主姓名: '朵丽', 身份: '驻军军需处洗衣工', 职业: '洗衣工、缝补工', 伤病与健康: '双手有裂口。',
     });
     assert.equal(lifeSummariesFromCarrierCard(card)[0].title, '第1世·江书宇');
+});
+
+test('actual v2 heading and colon format recovers the complete previous-life summary', () => {
+    const [life] = lifeSummariesFromCarrierCard(extractCarrierCards(actualCarrierCardVariant)[0]);
+    assert.equal(life.title, '第1世·江书宇');
+    assert.match(life.summary, /存活不足一天/);
+    assert.match(life.summary, /死亡原因：流矢穿颅/);
+});
+
+test('confirmed response JSONPatch recovers a legacy summary even when MVU drops the custom field', () => {
+    const response = `<UpdateVariable><JSONPatch>[{
+      "op":"insert",
+      "path":"/历代记忆摘要/-",
+      "value":{"世代编号":1,"身体姓名":"江书宇","身份":"无（异世界来客）","所处时期":"复兴纪元488年9月15日-16日","最重要经历":"在铁炉堡被流矢射杀","死亡原因":"流矢穿颅"}
+    }]</JSONPatch></UpdateVariable>`;
+    const [life] = lifeSummariesFromUpdateVariable(response);
+    assert.equal(life.title, '第1世·江书宇');
+    assert.match(life.summary, /在铁炉堡被流矢射杀/);
+
+    const truth = conversationLedgerTruth([
+        { is_user: false, mes: actualCarrierCardVariant.replace(/<b>===== 历代经历记忆 =====<\/b>[\s\S]*?<b>===== 不继承声明 =====<\/b>/, '<b>===== 不继承声明 =====</b>') },
+        { is_user: true, mes: '确认换身' },
+        { is_user: false, mes: response },
+    ]);
+    assert.equal(truth.currentRecord.profile.姓名, '忒娜·厄尔伯');
+    assert.equal(truth.lives[0].title, '第1世·江书宇');
+});
+
+test('generation two confirmation can fall back to the opening profile and narrative summaries', () => {
+    const noHistoryCard = actualCarrierCardVariant.replace(/<b>===== 历代经历记忆 =====<\/b>[\s\S]*?<b>===== 不继承声明 =====<\/b>/, '<b>===== 不继承声明 =====</b>');
+    const lives = rebuildConversationLives([
+        { is_user: true, mes: '姓名: 江书宇\n身份: 异世界来客\n性别: 男\n年龄: 16岁' },
+        { is_user: false, mes: '<summary>江书宇来到铁炉堡。</summary>后来被流矢贯穿头颅，当场死亡。' },
+        { is_user: false, mes: noHistoryCard },
+        { is_user: true, mes: '确认换身' },
+    ]);
+    assert.equal(lives[0].title, '第1世·江书宇');
+    assert.match(lives[0].summary, /来到铁炉堡/);
+});
+
+test('manual current-body data cannot overwrite recovered life records with an empty list', () => {
+    const recovered = [{ generation: 1, name: '江书宇', summary: '在铁炉堡死亡。' }];
+    assert.deepEqual(mergeLifeRecords([], recovered).map(item => item.title), ['第1世·江书宇']);
 });
 
 test('currentBodySummary lets a confirmed carrier override stale identity but keeps live status', () => {
