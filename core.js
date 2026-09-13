@@ -368,22 +368,55 @@ export function buildLifeRecord(currentBody, messages = [], endIndex = messages.
     };
 }
 
-export function rebuildConversationLives(messages = [], records = confirmedCarrierRecords(messages)) {
+export function mergeLifeRecords(...collections) {
     const byGeneration = new Map();
-    const put = item => {
-        const generation = Number(item?.generation);
-        if (!Number.isFinite(generation) || !item?.name) return;
-        const previous = byGeneration.get(generation);
-        if (!previous || String(item.summary || '').length >= String(previous.summary || '').length) {
-            byGeneration.set(generation, item);
+    for (const collection of collections) {
+        for (const item of collection || []) {
+            const generation = Number(item?.generation);
+            const name = String(item?.name || '').trim();
+            if (!Number.isFinite(generation) || !name) continue;
+            const normalized = {
+                ...item,
+                generation,
+                name,
+                title: item.title || `第${generation}世·${name}`,
+                summary: String(item.summary || '').trim(),
+            };
+            const previous = byGeneration.get(generation);
+            if (!previous || normalized.summary.length >= String(previous.summary || '').length) {
+                byGeneration.set(generation, normalized);
+            }
         }
-    };
+    }
+    return [...byGeneration.values()].sort((a, b) => Number(a.generation) - Number(b.generation));
+}
 
-    for (const record of records) inferredLivesFromCarrierCard(record.card).forEach(put);
+function hasConfirmedDeath(messages = [], endIndex = messages.length - 1) {
+    for (let index = 0; index <= Math.min(endIndex, messages.length - 1); index += 1) {
+        const message = messages[index];
+        if (!message || message.is_user || message.is_system) continue;
+        const text = carrierCardText(message.mes);
+        if (/当场死亡|死亡已确认|已经死亡|确认死亡|生命值\s*[：:]?\s*0(?:\D|$)|尸体/.test(text)) return true;
+    }
+    return false;
+}
+
+export function rebuildConversationLives(messages = [], records = confirmedCarrierRecords(messages)) {
+    const collected = [];
+    for (let index = 0; index < records.length; index += 1) {
+        const record = records[index];
+        collected.push(...inferredLivesFromCarrierCard(record.card));
+        const updateEnd = Math.max(record.confirmationIndex, (records[index + 1]?.cardIndex ?? messages.length) - 1);
+        for (let messageIndex = record.confirmationIndex + 1; messageIndex <= updateEnd; messageIndex += 1) {
+            const message = messages[messageIndex];
+            if (!message || message.is_user || message.is_system) continue;
+            collected.push(...lifeSummariesFromUpdateVariable(message.mes));
+        }
+    }
     for (let index = 1; index < records.length; index += 1) {
         const previous = records[index - 1];
         const current = records[index];
-        put(buildLifeRecord({
+        collected.push(buildLifeRecord({
             profile: previous.profile,
             rawCard: previous.card,
             generation: carrierGeneration(previous.card, index + 1),
@@ -391,7 +424,19 @@ export function rebuildConversationLives(messages = [], records = confirmedCarri
         }, messages, Math.max(previous.confirmationIndex, current.cardIndex - 1)));
     }
 
-    return [...byGeneration.values()].sort((a, b) => Number(a.generation) - Number(b.generation));
+    const first = records[0];
+    const firstGeneration = first ? carrierGeneration(first.card, 1) : 1;
+    const opening = initialPlayerProfile(messages);
+    const hasFirstLife = collected.some(item => Number(item?.generation) === 1);
+    if (first && firstGeneration > 1 && opening.姓名 && !hasFirstLife && hasConfirmedDeath(messages, first.confirmationIndex)) {
+        collected.push(buildLifeRecord({
+            profile: opening,
+            generation: 1,
+            startMessageIndex: 0,
+        }, messages, Math.max(0, first.cardIndex - 1)));
+    }
+
+    return mergeLifeRecords(collected);
 }
 
 export function conversationLedgerTruth(messages = [], suppressedRecordKeys = []) {
@@ -411,20 +456,79 @@ export function confirmedCarrierProfile(messages = []) {
 
 export function lifeSummariesFromCarrierCard(card) {
     const text = decodeHtmlText(card);
-    const section = text.match(/历代经历记忆(?:简短索引)?[：:]\s*([\s\S]*?)(?=上一具身体死亡信息[：:]|※\s*历代旧人格|$)/)?.[1] || '';
+    const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+    const headingText = line => line.replace(/^[\s=*#—–-]+|[\s=*#—–-]+$/g, '').trim();
+    const start = lines.findIndex(line => /^历代经历记忆(?:简短索引)?\s*[：:]?$/.test(headingText(line)));
+    if (start < 0) return [];
     const summaries = [];
-    for (const line of section.split('\n')) {
-        const match = line.trim().match(/^[·•\-]?\s*第\s*(\d+)\s*世[：:·・]\s*(.+?)\s*(?:——|--|—)\s*(.+)$/);
-        if (!match) continue;
-        summaries.push({
-            generation: Number(match[1]),
-            name: match[2].trim(),
-            title: `第${match[1]}世·${match[2].trim()}`,
-            summary: match[3].trim(),
-            source: 'confirmed-card',
-        });
+    let current = null;
+    for (const line of lines.slice(start + 1)) {
+        const heading = headingText(line);
+        if (/^(?:上一具身体死亡信息|不继承声明|历代旧人格)/.test(heading)) break;
+        const source = line.replace(/^[·•]\s*/, '').trim();
+        const match = source.match(/^第\s*(\d+)\s*世\s*[·・]\s*(.+?)\s*(?:——|--|—|[：:])\s*(.+)$/)
+            || source.match(/^第\s*(\d+)\s*世\s*[：:]\s*(.+?)\s*(?:——|--|—)\s*(.+)$/);
+        if (match) {
+            current = {
+                generation: Number(match[1]),
+                name: match[2].trim(),
+                title: `第${match[1]}世·${match[2].trim()}`,
+                summary: match[3].trim(),
+                source: 'confirmed-card',
+            };
+            summaries.push(current);
+            continue;
+        }
+        if (current && /^(?:死亡原因|重要经历|关键经历|死亡信息)[：:]/.test(source)) {
+            current.summary = `${current.summary}；${source}`;
+        }
     }
     return summaries;
+}
+
+function summaryFromArchiveDraft(value) {
+    const text = carrierCardText(value);
+    const title = text.match(/[【[]?第\s*(\d+)\s*世\s*[·・:：—-]\s*([^】\]\n:：—-]{1,80})[】\]]?/);
+    if (!title) return null;
+    const summary = text
+        .replace(title[0], '')
+        .replace(/^\s*[：:]?\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 4000);
+    return {
+        generation: Number(title[1]),
+        name: title[2].trim(),
+        title: `第${title[1]}世·${title[2].trim()}`,
+        summary: summary || `${title[2].trim()}这一世已经结束。`,
+        source: 'update-variable',
+    };
+}
+
+export function lifeSummariesFromUpdateVariable(value) {
+    const summaries = [];
+    for (const block of String(value || '').matchAll(/<JSONPatch>\s*([\s\S]*?)\s*<\/JSONPatch>/gi)) {
+        let operations;
+        try {
+            operations = JSON.parse(block[1]);
+        } catch {
+            continue;
+        }
+        if (!Array.isArray(operations)) continue;
+        for (const operation of operations) {
+            const path = String(operation?.path || '');
+            let summary = null;
+            if (/\/历代记忆摘要(?:\/-|\/\d+)?$/.test(path)) summary = summaryFromIndex(operation.value);
+            else if (/\/待归档人生词条$/.test(path) && typeof operation.value === 'string') {
+                summary = summaryFromArchiveDraft(operation.value);
+            }
+            if (summary) summaries.push({
+                ...summary,
+                source: 'update-variable',
+            });
+        }
+    }
+    return mergeLifeRecords(summaries);
 }
 
 function summaryFromIndex(item) {

@@ -17,6 +17,7 @@ import {
     getPath,
     inferredLivesFromCarrierCard,
     lifeHistorySummaries,
+    mergeLifeRecords,
     normalizeEntries,
     parseCarrierCard,
     rebuildConversationLives,
@@ -30,7 +31,7 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 2, injectionMode: 'full' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 3, injectionMode: 'full' });
 let initialized = false;
 let refreshTimers = [];
 
@@ -49,11 +50,11 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 3, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 4, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
-        data.version = 3;
+        data.version = 4;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -91,14 +92,7 @@ const readStatData = () => mvu.readStatData();
 const writeMessagePath = (path, value) => mvu.writeMessagePath(path, value);
 
 function mergeLives(data, incoming) {
-    const byGeneration = new Map((data.lives || []).map(item => [Number(item.generation), item]));
-    for (const item of incoming || []) {
-        if (!Number.isFinite(Number(item?.generation)) || !item?.name) continue;
-        const generation = Number(item.generation);
-        const previous = byGeneration.get(generation);
-        if (!previous || String(item.summary || '').length > String(previous.summary || '').length) byGeneration.set(generation, item);
-    }
-    data.lives = [...byGeneration.values()].sort((a, b) => Number(a.generation) - Number(b.generation));
+    data.lives = mergeLifeRecords(data.lives, incoming);
 }
 
 function saveImportedBody(card, profile, messageIndex, mode = 'sync', sourceType = 'manual') {
@@ -175,7 +169,7 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
         const manualIsNewest = matching && (!record || matching.messageIndex >= record.cardIndex);
         if (manualIsNewest) {
             nextBody = { ...previous, sourceMessageIndex: matching.messageIndex };
-            nextLives = data.lives || [];
+            nextLives = mergeLifeRecords(data.lives, truth.lives, inferredLivesFromCarrierCard(matching.card));
         }
     }
 
@@ -681,7 +675,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.2.1 已加载');
+    console.log('[历代人生管理器] v0.2.2 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
