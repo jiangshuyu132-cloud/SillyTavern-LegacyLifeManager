@@ -296,6 +296,35 @@ export function confirmedCarrierRecords(messages = []) {
     return records;
 }
 
+export function stableTextFingerprint(value) {
+    const text = String(value || '').replace(/\r/g, '').trim();
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}-${text.length}`;
+}
+
+export function carrierRecordKey(record, messages = []) {
+    if (!record?.card) return '';
+    const confirmation = messages[record.confirmationIndex] || {};
+    const confirmationIdentity = confirmation.send_date
+        || confirmation.gen_started
+        || confirmation.extra?.gen_id
+        || `${record.confirmationIndex}:${String(confirmation.mes || '').trim()}`;
+    return `${stableTextFingerprint(record.card)}:${stableTextFingerprint(confirmationIdentity)}`;
+}
+
+export function carrierGeneration(card, fallback = 1) {
+    const text = carrierCardText(card);
+    const arabic = text.match(/世代(?:编号)?[：:]\s*第?\s*(\d+)\s*世/);
+    if (arabic) return Number(arabic[1]);
+    const chinese = text.match(/世代(?:编号)?[：:]\s*第?\s*([一二三四五六七八九十]+)\s*世/);
+    const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+    return chinese ? (digits[chinese[1]] || fallback) : fallback;
+}
+
 export function responseSummaries(messages = [], startIndex = 0, endIndex = messages.length - 1) {
     const summaries = [];
     const seen = new Set();
@@ -336,6 +365,43 @@ export function buildLifeRecord(currentBody, messages = [], endIndex = messages.
         endMessageIndex: Math.max(0, Number(endIndex || 0)),
         archivedAt: new Date().toISOString(),
         source: 'plugin-ledger',
+    };
+}
+
+export function rebuildConversationLives(messages = [], records = confirmedCarrierRecords(messages)) {
+    const byGeneration = new Map();
+    const put = item => {
+        const generation = Number(item?.generation);
+        if (!Number.isFinite(generation) || !item?.name) return;
+        const previous = byGeneration.get(generation);
+        if (!previous || String(item.summary || '').length >= String(previous.summary || '').length) {
+            byGeneration.set(generation, item);
+        }
+    };
+
+    for (const record of records) inferredLivesFromCarrierCard(record.card).forEach(put);
+    for (let index = 1; index < records.length; index += 1) {
+        const previous = records[index - 1];
+        const current = records[index];
+        put(buildLifeRecord({
+            profile: previous.profile,
+            rawCard: previous.card,
+            generation: carrierGeneration(previous.card, index + 1),
+            startMessageIndex: previous.confirmationIndex,
+        }, messages, Math.max(previous.confirmationIndex, current.cardIndex - 1)));
+    }
+
+    return [...byGeneration.values()].sort((a, b) => Number(a.generation) - Number(b.generation));
+}
+
+export function conversationLedgerTruth(messages = [], suppressedRecordKeys = []) {
+    const suppressed = new Set(suppressedRecordKeys || []);
+    const records = confirmedCarrierRecords(messages)
+        .filter(record => !suppressed.has(carrierRecordKey(record, messages)));
+    return {
+        records,
+        currentRecord: records.at(-1) || null,
+        lives: rebuildConversationLives(messages, records),
     };
 }
 

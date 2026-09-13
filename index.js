@@ -4,10 +4,13 @@ import {
     archiveTitle,
     asObject,
     buildLifeRecord,
+    carrierGeneration,
     carrierCardSections,
     carrierCardText,
+    carrierRecordKey,
     confirmedCarrierProfile,
     confirmedCarrierRecords,
+    conversationLedgerTruth,
     currentBodySummary,
     detectCarryover,
     extractCarrierCards,
@@ -16,7 +19,9 @@ import {
     lifeHistorySummaries,
     normalizeEntries,
     parseCarrierCard,
+    rebuildConversationLives,
     safeFilename,
+    stableTextFingerprint,
     supplementalPlayerProfile,
     upsertArchive,
 } from './core.js';
@@ -44,13 +49,14 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 2, currentBody: null, lives: [], pendingSnapshot: null, backups: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 3, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
-        data.version = 2;
+        data.version = 3;
         data.lives ??= [];
         data.currentBody ??= null;
+        data.suppressedRecordKeys ??= [];
         data.backups ??= [];
     }
     return data;
@@ -95,22 +101,13 @@ function mergeLives(data, incoming) {
     data.lives = [...byGeneration.values()].sort((a, b) => Number(a.generation) - Number(b.generation));
 }
 
-function generationFromCard(card, fallback = 1) {
-    const text = carrierCardText(card);
-    const arabic = text.match(/世代(?:编号)?[：:]\s*第?\s*(\d+)\s*世/);
-    if (arabic) return Number(arabic[1]);
-    const chinese = text.match(/世代(?:编号)?[：:]\s*第?\s*([一二三四五六七八九十]+)\s*世/);
-    const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
-    return chinese ? (digits[chinese[1]] || fallback) : fallback;
-}
-
-function saveImportedBody(card, profile, messageIndex, mode = 'sync') {
+function saveImportedBody(card, profile, messageIndex, mode = 'sync', sourceType = 'manual') {
     const data = chatData();
     const messages = context()?.chat || [];
     const previous = data.currentBody;
     const inferred = inferredLivesFromCarrierCard(card);
     mergeLives(data, inferred);
-    const generation = generationFromCard(card, Math.max(1, ...data.lives.map(item => Number(item.generation) + 1).filter(Number.isFinite)));
+    const generation = carrierGeneration(card, Math.max(1, ...data.lives.map(item => Number(item.generation) + 1).filter(Number.isFinite)));
     if (mode === 'confirm' && previous && previous.profile?.姓名 !== profile.姓名) {
         mergeLives(data, [buildLifeRecord(previous, messages, Math.max(0, messageIndex - 1))]);
     }
@@ -120,6 +117,8 @@ function saveImportedBody(card, profile, messageIndex, mode = 'sync') {
         text: carrierCardText(card),
         sections: carrierCardSections(card),
         sourceMessageIndex: messageIndex,
+        sourceCardFingerprint: stableTextFingerprint(card),
+        sourceType,
         startMessageIndex: mode === 'confirm' ? messageIndex : (previous?.startMessageIndex ?? messageIndex),
         generation,
         confirmed: mode === 'confirm' || previous?.confirmed === true,
@@ -130,13 +129,68 @@ function saveImportedBody(card, profile, messageIndex, mode = 'sync') {
     return data.currentBody;
 }
 
-function syncDetectedConversation() {
-    const ctx = context();
+function backupLedger(data, reason) {
+    if (!data?.currentBody && !(data?.lives || []).length) return;
+    data.backups ??= [];
+    data.backups.push({
+        at: new Date().toISOString(),
+        reason,
+        currentBody: data.currentBody,
+        lives: data.lives,
+    });
+    data.backups = data.backups.slice(-5);
+}
+
+function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
+    const sourceRecordKey = carrierRecordKey(record, messages);
+    return {
+        profile: record.profile,
+        rawCard: record.card,
+        text: carrierCardText(record.card),
+        sections: carrierCardSections(record.card),
+        sourceMessageIndex: record.cardIndex,
+        confirmationMessageIndex: record.confirmationIndex,
+        sourceCardFingerprint: stableTextFingerprint(record.card),
+        sourceRecordKey,
+        sourceType: 'conversation',
+        startMessageIndex: record.confirmationIndex,
+        generation: carrierGeneration(record.card, Math.max(1, ...lives.map(item => Number(item.generation) + 1).filter(Number.isFinite))),
+        confirmed: true,
+        importedAt: previous?.sourceRecordKey === sourceRecordKey ? previous.importedAt : new Date().toISOString(),
+    };
+}
+
+function reconcileConversation({ force = false, reason = '自动对账' } = {}) {
     const data = chatData();
-    const record = confirmedCarrierRecords(ctx?.chat || []).at(-1);
-    if (!record || data.currentBody?.sourceMessageIndex === record.cardIndex) return false;
-    saveImportedBody(record.card, record.profile, record.cardIndex, 'confirm');
-    return true;
+    const messages = context()?.chat || [];
+    const truth = conversationLedgerTruth(messages, force ? [] : data.suppressedRecordKeys);
+    const records = truth.records;
+    const record = truth.currentRecord;
+    const previous = data.currentBody;
+    let nextLives = truth.lives;
+    let nextBody = record ? bodyFromConfirmedRecord(record, messages, nextLives, previous) : null;
+
+    if (!force && previous?.sourceType === 'manual') {
+        const matching = availableCarrierCards().find(item => stableTextFingerprint(item.card) === previous.sourceCardFingerprint);
+        const manualIsNewest = matching && (!record || matching.messageIndex >= record.cardIndex);
+        if (manualIsNewest) {
+            nextBody = { ...previous, sourceMessageIndex: matching.messageIndex };
+            nextLives = data.lives || [];
+        }
+    }
+
+    const previousKey = previous?.sourceRecordKey || previous?.sourceCardFingerprint
+        || (previous?.rawCard ? stableTextFingerprint(previous.rawCard) : '');
+    const nextKey = nextBody?.sourceRecordKey || nextBody?.sourceCardFingerprint || '';
+    const changed = previousKey !== nextKey || JSON.stringify(data.lives || []) !== JSON.stringify(nextLives);
+    if (!changed) return { changed: false, cleared: false, restored: false };
+
+    backupLedger(data, reason);
+    data.currentBody = nextBody;
+    data.lives = nextLives;
+    if (force) data.suppressedRecordKeys = [];
+    saveChatMetadata();
+    return { changed: true, cleared: Boolean(previous && !nextBody), restored: Boolean(nextBody), previous, current: nextBody };
 }
 
 function currentImportedBody() {
@@ -172,6 +226,7 @@ function buildCurrentBodyPrompt(body, statData, mode) {
 async function updateCurrentBodyPrompt() {
     const ctx = context();
     if (typeof ctx?.setExtensionPrompt !== 'function') return;
+    reconcileConversation({ reason: '生成前校验' });
     const prompt = buildCurrentBodyPrompt(currentImportedBody(), readStatData(), settings().injectionMode || 'full');
     await ctx.setExtensionPrompt(PROMPT_KEY, prompt, 1, 0, false, 0);
 }
@@ -330,6 +385,29 @@ function importSelectedCard(record, mode) {
     render();
 }
 
+async function rebuildFromCurrentChat() {
+    if (!globalThis.confirm('根据当前仍然存在的正文楼层，重新建立当前身体和历代人生？\n\n已删除楼层产生的记录会从插件中撤销，但不会删除已经写入世界书的词条。')) return;
+    const result = reconcileConversation({ force: true, reason: '手动从当前正文重建' });
+    await updateCurrentBodyPrompt();
+    await render();
+    if (result.current) notify('success', `已按当前正文重建：${result.current.profile?.姓名 || '当前身体'}`);
+    else notify('info', '当前正文没有有效的已确认换身记录；已撤销孤立身体和历代记录');
+}
+
+async function clearCurrentChatLedger() {
+    if (!globalThis.confirm('清空本聊天由插件保存的当前身体、历代人生和 AI 注入？\n\n现有确认楼层会暂时忽略；以后新产生的确认记录仍可自动识别。世界书内容不会被删除。')) return;
+    const data = chatData();
+    const messages = context()?.chat || [];
+    backupLedger(data, '手动清空本聊天插件记录');
+    data.suppressedRecordKeys = confirmedCarrierRecords(messages).map(record => carrierRecordKey(record, messages));
+    data.currentBody = null;
+    data.lives = [];
+    saveChatMetadata();
+    await updateCurrentBodyPrompt();
+    await render();
+    notify('success', '已清空本聊天的插件记录和 AI 当前身体注入');
+}
+
 function renderFullBody(panel, body) {
     if (!body?.text) return;
     const heading = el('h3', '', '完整当前身体档案');
@@ -485,14 +563,14 @@ function renderSettings(panel) {
         createButton('同步为当前身体', () => importSelectedCard(cards[Number(cardSelect.value)], 'sync')),
         createButton('确认换身并导入', () => importSelectedCard(cards[Number(cardSelect.value)], 'confirm'), 'menu_button llm-primary'),
     );
-    const repair = createButton('扫描并修复本聊天', () => {
-        const record = confirmedCarrierRecords(context()?.chat || []).at(-1);
-        if (!record) return notify('warning', '未找到人物卡与确认换身记录；可从上方手动选择人物卡');
-        importSelectedCard({ messageIndex: record.cardIndex, card: record.card, profile: record.profile }, 'confirm');
-    });
+    const ledgerActions = el('div', 'llm-actions');
+    ledgerActions.append(
+        createButton('从当前正文重新同步', rebuildFromCurrentChat, 'menu_button llm-primary'),
+        createButton('清空本聊天插件记录', clearCurrentChatLedger),
+    );
     const safety = el('div', 'llm-safety');
-    safety.textContent = '插件自动识别正文中已由你确认的新身体，不处理候选，也不会替你发送确认口令；归档只追加到已有世界书，同名异文会停止。';
-    panel.append(label, select, active, injectionLabel, importLabel, importActions, repair, safety, createButton('导出完整备份', exportBackup, 'menu_button llm-primary'));
+    safety.textContent = '当前正文是事实来源：删除、编辑、切换或重生成相关楼层后，插件会撤销失去来源的身体、历代记录和 AI 注入。已经写入世界书的词条不会自动删除。';
+    panel.append(label, select, active, injectionLabel, importLabel, importActions, ledgerActions, safety, createButton('导出完整备份', exportBackup, 'menu_button llm-primary'));
 }
 
 function createPanel() {
@@ -539,7 +617,7 @@ async function render() {
     if (!Object.keys(asObject(statData)).length) {
         panel.append(el('div', 'llm-warning', '没有检测到 stat_data；身份与历代人生仍会尝试从已确认的正文人物卡读取。'));
     }
-    syncDetectedConversation();
+    reconcileConversation({ reason: '打开或刷新聊天' });
     capturePendingSnapshot(statData);
     if (tab === 'current') renderCurrent(panel, statData);
     if (tab === 'lives') await renderLives(panel, statData);
@@ -565,7 +643,9 @@ function installCardButtons() {
     }
 }
 
-function scheduleRefresh() {
+function scheduleRefresh(reason = '正文楼层变化') {
+    const result = reconcileConversation({ reason });
+    if (result.cleared) notify('info', '相关人物卡或确认楼层已不存在，插件已撤销旧身体、历代记录和 AI 注入');
     refreshTimers.forEach(clearTimeout);
     refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(() => {
         render().catch(error => console.error('[历代人生管理器] 渲染失败', error));
@@ -578,7 +658,7 @@ function registerEvents() {
     const ctx = context();
     if (!ctx?.eventSource || !ctx?.eventTypes) return;
     for (const type of ['CHAT_CHANGED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
-        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], scheduleRefresh);
+        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => scheduleRefresh(type));
     }
     for (const type of ['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS']) {
         if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], updateCurrentBodyPrompt);
@@ -601,7 +681,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.2.0 已加载');
+    console.log('[历代人生管理器] v0.2.1 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
