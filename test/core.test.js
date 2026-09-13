@@ -7,11 +7,14 @@ import {
     currentBodySummary,
     detectCarryover,
     extractCharacterCard,
+    extractCharacterCards,
     getPath,
+    initialPlayerProfile,
     normalizeEntries,
     normalizeStage,
     formatSummaryValue,
     safeFilename,
+    supplementalPlayerProfile,
     upsertArchive,
 } from '../core.js';
 import { createMvuAdapter, statDataFromMessage, statDataFromVariables } from '../mvu-adapter.js';
@@ -37,6 +40,28 @@ test('extractCharacterCard prefers tagged card', () => {
 
 test('extractCharacterCard recognizes fenced data', () => {
     assert.match(extractCharacterCard('```yaml\n姓名: 林\n职业: 骑士\n```'), /职业/);
+});
+
+test('extractCharacterCards returns every tagged card', () => {
+    const result = extractCharacterCards('<char_info>姓名: 甲</char_info>正文<char_info>姓名: 乙</char_info>');
+    assert.deepEqual(result, ['姓名: 甲', '姓名: 乙']);
+});
+
+test('initialPlayerProfile reads explicit opening fields', () => {
+    const result = initialPlayerProfile([{ is_user: true, mes: '姓名: 江书宇\n身份: 转生者\n性别: 男\n年龄: 16岁\n起始地点: 铁炉堡' }]);
+    assert.deepEqual(result, { 姓名: '江书宇', 原主姓名: '江书宇', 身份: '转生者', 性别: '男', 年龄: '16岁', 地点: '铁炉堡' });
+});
+
+test('supplementalPlayerProfile matches the player card instead of a newer NPC card', () => {
+    const messages = [
+        { is_user: true, mes: '姓名: 江书宇\n身份: 转生者\n性别: 男\n年龄: 16岁' },
+        { is_user: false, mes: '<char_info>姓名: 江书宇\n种族: 人类（异世界来客）\n身份: 无\n职业: 无（原世界学生）</char_info>' },
+        { is_user: false, mes: '<char_info>姓名: 扎伊·克雷顿\n种族: 人类\n身份: 巡逻队副长\n职业: 帝国卫兵</char_info>' },
+    ];
+    assert.deepEqual(supplementalPlayerProfile(messages, { 主角: {} }), {
+        姓名: '江书宇', 原主姓名: '江书宇', 身份: '无', 性别: '男', 年龄: '16岁',
+        种族: '人类（异世界来客）', 职业: '无（原世界学生）',
+    });
 });
 
 test('archiveTitle parses explicit title', () => {
@@ -112,6 +137,26 @@ test('currentBodySummary makes legacy chat fields useful without guessing missin
     assert.equal(rows.职业, '暂无职业');
     assert.equal(rows.地点, '铁炉堡-城防值班室');
     assert.equal(rows.健康, '生命值 206/206 · 无状态效果');
+});
+
+test('currentBodySummary merges a legacy chat character card without replacing live status', () => {
+    const result = currentBodySummary({
+        主角: {
+            种族: '人类', 身份: [], 职业: [],
+            生命值: { 当前: 206, 上限: { _基础: 200, 额外: 6 } }, 状态效果: {},
+        },
+        世界: { 地点: '城防值班室' },
+    }, {
+        姓名: '江书宇', 原主姓名: '江书宇', 年龄: '16岁', 性别: '男',
+        种族: '人类（异世界来客）', 身份: '无', 职业: '无（原世界学生）',
+    });
+    assert.equal(result.name, '江书宇');
+    assert.equal(result.usedSupplementalProfile, true);
+    assert.deepEqual(Object.fromEntries(result.rows), {
+        原主: '江书宇', 年龄: '16岁', 性别: '男', 种族: '人类（异世界来客）',
+        身份: '无', 职业: '无（原世界学生）', 地点: '城防值班室',
+        健康: '生命值 206/206 · 无状态效果',
+    });
 });
 
 test('statDataFromVariables reads object and JSON forms', () => {
