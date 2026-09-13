@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Codex & SillyTavern user",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "auto_update": true,
   "homePage": "https://github.com/jiangshuyu132-cloud/SillyTavern-LegacyLifeManager",
   "hooks": {

@@ -45,9 +45,11 @@ function resourceMaximum(resource) {
     return (Number.isFinite(base) ? base : 0) + (Number.isFinite(extra) ? extra : 0);
 }
 
-export function currentBodySummary(statData = {}) {
+export function currentBodySummary(statData = {}, supplementalProfile = {}) {
     const main = asObject(statData?.主角);
     const profile = asObject(main.载体档案);
+    const supplemental = asObject(supplementalProfile);
+    const hasCarrierProfile = Object.keys(profile).length > 0;
     const hp = asObject(main.生命值);
     const effects = Object.keys(asObject(main.状态效果));
     let health = profile.伤病与健康;
@@ -58,16 +60,17 @@ export function currentBodySummary(statData = {}) {
         health += effects.length ? ` · 状态：${effects.join('、')}` : ' · 无状态效果';
     }
     return {
-        name: formatSummaryValue(profile.姓名 || main.姓名, '当前变量未提供姓名'),
+        name: formatSummaryValue(profile.姓名 || main.姓名 || supplemental.姓名, '当前变量未提供姓名'),
         main,
+        usedSupplementalProfile: !hasCarrierProfile && Object.keys(supplemental).length > 0,
         rows: [
-            ['原主', formatSummaryValue(profile.原主姓名 || main.原主姓名)],
-            ['年龄', formatSummaryValue(profile.年龄 || main.年龄)],
-            ['性别', formatSummaryValue(profile.性别 || main.性别)],
-            ['种族', formatSummaryValue(main.种族)],
-            ['身份', formatSummaryValue(main.身份, '暂无身份')],
-            ['职业', formatSummaryValue(main.职业, '暂无职业')],
-            ['地点', formatSummaryValue(profile.当前地点与处境 || getPath(statData, '世界.地点'))],
+            ['原主', formatSummaryValue(profile.原主姓名 || main.原主姓名 || supplemental.原主姓名)],
+            ['年龄', formatSummaryValue(profile.年龄 || main.年龄 || supplemental.年龄)],
+            ['性别', formatSummaryValue(profile.性别 || main.性别 || supplemental.性别)],
+            ['种族', formatSummaryValue(hasCarrierProfile ? main.种族 : (supplemental.种族 || main.种族))],
+            ['身份', formatSummaryValue(hasCarrierProfile ? main.身份 : (supplemental.身份 || main.身份), '暂无身份')],
+            ['职业', formatSummaryValue(hasCarrierProfile ? main.职业 : (supplemental.职业 || main.职业), '暂无职业')],
+            ['地点', formatSummaryValue(profile.当前地点与处境 || getPath(statData, '世界.地点') || supplemental.地点)],
             ['健康', formatSummaryValue(health)],
         ],
     };
@@ -94,6 +97,92 @@ export function extractCharacterCard(text) {
 
     if (/人物卡|姓名[:：]|原主姓名[:：]/.test(source)) return source;
     return '';
+}
+
+export function extractCharacterCards(text) {
+    const source = String(text || '');
+    if (!source.trim()) return [];
+    const cards = [];
+    for (const pattern of [
+        /<char_info\b[^>]*>([\s\S]*?)<\/char_info>/gi,
+        /<character_card\b[^>]*>([\s\S]*?)<\/character_card>/gi,
+        /<人物卡\b[^>]*>([\s\S]*?)<\/人物卡>/gi,
+    ]) {
+        for (const match of source.matchAll(pattern)) {
+            const card = match[1]?.trim();
+            if (card) cards.push(card);
+        }
+    }
+    return cards;
+}
+
+function cleanInlineCardValue(value) {
+    const text = String(value ?? '').trim();
+    if (!text || ['|', '>', 'null', 'undefined'].includes(text.toLowerCase())) return '';
+    return text.replace(/^['"]|['"]$/g, '').trim();
+}
+
+export function parseCharacterCard(card) {
+    const source = String(card || '').replace(/\r/g, '');
+    const result = {};
+    for (const key of ['姓名', '生命层级', '等级', '种族', '身份', '职业', '性别', '年龄']) {
+        const match = source.match(new RegExp(`^${key}\\s*[:：]\\s*(.*?)\\s*$`, 'm'));
+        const value = cleanInlineCardValue(match?.[1]);
+        if (value) result[key] = value;
+    }
+    return result;
+}
+
+function firstTopLevelField(text, key) {
+    const source = String(text || '').replace(/\r/g, '');
+    const match = source.match(new RegExp(`^\\s{0,4}${key}\\s*[:：]\\s*([^\\n]+)`, 'm'));
+    return cleanInlineCardValue(match?.[1]);
+}
+
+export function initialPlayerProfile(messages = []) {
+    for (const message of messages) {
+        if (!message?.is_user || message?.is_system) continue;
+        const text = String(message.mes || '');
+        const name = firstTopLevelField(text, '姓名');
+        if (!name) continue;
+        const identity = firstTopLevelField(text, '身份');
+        const gender = firstTopLevelField(text, '性别');
+        const age = firstTopLevelField(text, '年龄');
+        const location = firstTopLevelField(text, '起始地点');
+        return {
+            姓名: name,
+            原主姓名: name,
+            ...(identity ? { 身份: identity } : {}),
+            ...(gender ? { 性别: gender } : {}),
+            ...(age ? { 年龄: age } : {}),
+            ...(location ? { 地点: location } : {}),
+        };
+    }
+    return {};
+}
+
+export function supplementalPlayerProfile(messages = [], statData = {}) {
+    const opening = initialPlayerProfile(messages);
+    const main = asObject(statData?.主角);
+    const carrier = asObject(main.载体档案);
+    const preferredName = String(carrier.姓名 || main.姓名 || opening.姓名 || '').trim();
+    let matched = {};
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message || message.is_user || message.is_system) continue;
+        const cards = extractCharacterCards(message.mes);
+        for (let cardIndex = cards.length - 1; cardIndex >= 0; cardIndex -= 1) {
+            const parsed = parseCharacterCard(cards[cardIndex]);
+            if (parsed.姓名 && (!preferredName || parsed.姓名 === preferredName)) {
+                matched = parsed;
+                break;
+            }
+        }
+        if (Object.keys(matched).length) break;
+    }
+
+    return { ...opening, ...matched };
 }
 
 export function archiveTitle(draft, statData = {}) {

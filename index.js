@@ -10,6 +10,7 @@ import {
     normalizeEntries,
     normalizeStage,
     safeFilename,
+    supplementalPlayerProfile,
     upsertArchive,
 } from './core.js';
 import { createMvuAdapter } from './mvu-adapter.js';
@@ -259,7 +260,7 @@ function el(tag, className, text) {
 }
 
 function renderCurrent(panel, statData) {
-    const summary = currentBodySummary(statData);
+    const summary = currentBodySummary(statData, supplementalPlayerProfile(context()?.chat || [], statData));
     const main = summary.main;
     const header = el('div', 'llm-card-head');
     header.append(el('div', 'llm-avatar', '◈'), el('div', '', summary.name));
@@ -273,6 +274,9 @@ function renderCurrent(panel, statData) {
     details.append(el('summary', '', '查看完整 stat_data.主角'), el('pre', 'llm-json', pretty(main)));
     const warnings = carryoverWarnings(statData);
     panel.append(header, grid);
+    if (summary.usedSupplementalProfile) {
+        panel.append(el('div', 'llm-muted', '人物资料来自当前聊天的人物卡；地点、生命值与状态来自 stat_data。'));
+    }
     if (warnings.length) {
         const warning = el('div', 'llm-warning');
         warning.append(el('strong', '', '继承检查提醒'), ...warnings.map(item => el('div', '', `• ${item}`)));
