@@ -27,6 +27,103 @@ export function getPath(value, path, fallback) {
     return current;
 }
 
+function decodeJsonPatchBlock(value) {
+    return String(value || '')
+        .replace(/^\s*```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&amp;/gi, '&')
+        .trim();
+}
+
+export function extractJsonPatchOperations(value) {
+    const operations = [];
+    for (const block of String(value || '').matchAll(/<JSONPatch\b[^>]*>\s*([\s\S]*?)\s*<\/JSONPatch>/gi)) {
+        try {
+            const parsed = JSON.parse(decodeJsonPatchBlock(block[1]));
+            if (Array.isArray(parsed)) operations.push(...parsed.filter(item => item && typeof item === 'object'));
+        } catch { /* malformed variable output must not break the extension */ }
+    }
+    return operations;
+}
+
+function jsonPointerParts(path) {
+    const source = String(path || '').trim();
+    if (!source.startsWith('/')) return [];
+    const parts = source.slice(1).split('/').map(part => part.replace(/~1/g, '/').replace(/~0/g, '~'));
+    if (parts[0] === 'stat_data') parts.shift();
+    if (parts[0] === '最新动态') parts[0] = '主角';
+    if (!['主角', '世界'].includes(parts[0])) return [];
+    if (parts.some(part => ['__proto__', 'prototype', 'constructor'].includes(part))) return [];
+    return parts;
+}
+
+function applyJsonPointerOperation(root, operation) {
+    const parts = jsonPointerParts(operation?.path);
+    if (!parts.length || !['add', 'replace', 'remove'].includes(operation?.op)) return false;
+    let parent = root;
+    for (let index = 0; index < parts.length - 1; index += 1) {
+        const part = parts[index];
+        const nextIsArray = parts[index + 1] === '-' || /^\d+$/.test(parts[index + 1]);
+        if (!parent[part] || typeof parent[part] !== 'object') parent[part] = nextIsArray ? [] : {};
+        parent = parent[part];
+    }
+    const key = parts.at(-1);
+    if (Array.isArray(parent)) {
+        const index = key === '-' ? parent.length : Number(key);
+        if (!Number.isInteger(index) || index < 0) return false;
+        if (operation.op === 'remove') {
+            if (index >= parent.length) return false;
+            parent.splice(index, 1);
+        } else if (operation.op === 'add' && index < parent.length) {
+            if (JSON.stringify(parent[index]) === JSON.stringify(operation.value)) return false;
+            parent.splice(index, 0, clone(operation.value));
+        } else if (operation.op === 'add' && key === '-' && parent.some(item => JSON.stringify(item) === JSON.stringify(operation.value))) {
+            // The base snapshot may already contain this append. Keep replay idempotent.
+            return false;
+        } else {
+            if (JSON.stringify(parent[index]) === JSON.stringify(operation.value)) return false;
+            parent[index] = clone(operation.value);
+        }
+        return true;
+    }
+    if (!parent || typeof parent !== 'object') return false;
+    if (operation.op === 'remove') {
+        if (!Object.hasOwn(parent, key)) return false;
+        delete parent[key];
+    } else {
+        if (JSON.stringify(parent[key]) === JSON.stringify(operation.value)) return false;
+        parent[key] = clone(operation.value);
+    }
+    return true;
+}
+
+/**
+ * Replays body/world JSONPatch output that may not yet have reached MVU's stored
+ * message snapshot. `/最新动态/*` is a legacy prompt alias for `/主角/*`.
+ * The result is an in-memory view only; this never rewrites chat variables.
+ */
+export function replayDynamicStatData(statData = {}, messages = [], options = {}) {
+    const result = clone(asObject(statData));
+    const startIndex = Math.max(0, Number(options?.startIndex || 0));
+    let appliedOperations = 0;
+    let lastMessageIndex = -1;
+    for (let index = startIndex; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (!message || message.is_user || message.is_system) continue;
+        for (const operation of extractJsonPatchOperations(message.mes)) {
+            if (applyJsonPointerOperation(result, operation)) {
+                appliedOperations += 1;
+                lastMessageIndex = index;
+            }
+        }
+    }
+    return { statData: result, appliedOperations, lastMessageIndex };
+}
+
 export function formatSummaryValue(value, fallback = '当前变量未提供') {
     if (Array.isArray(value)) {
         const text = value.map(item => String(item ?? '').trim()).filter(Boolean).join('、');
@@ -58,14 +155,15 @@ export function currentBodySummary(statData = {}, supplementalProfile = {}, opti
     const liveProfile = profileMatchesSupplemental ? profile : {};
     const hp = asObject(main.生命值);
     const effects = Object.keys(asObject(main.状态效果));
-    let health = liveProfile.伤病与健康;
-    if (!health && (hp.当前 != null || resourceMaximum(hp) != null)) {
+    let health = '';
+    if (hp.当前 != null || resourceMaximum(hp) != null) {
         const current = formatSummaryValue(hp.当前);
         const maximum = resourceMaximum(hp);
         health = `生命值 ${current}/${maximum ?? '当前变量未提供'}`;
         health += effects.length ? ` · 状态：${effects.join('、')}` : ' · 无状态效果';
     }
-    if (!health) health = supplemental.伤病与健康;
+    else if (effects.length) health = `状态：${effects.join('、')}`;
+    if (!health) health = liveProfile.伤病与健康 || supplemental.伤病与健康;
     const identityFirst = preferSupplemental ? supplemental : liveProfile;
     const identitySecond = preferSupplemental ? liveProfile : supplemental;
     return {

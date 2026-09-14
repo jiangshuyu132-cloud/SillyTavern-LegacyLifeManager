@@ -330,6 +330,31 @@
 .llm-section-title { display: flex; margin: 0.25rem 0 0; align-items: center; gap: 0.55rem; color: #e4e5eb; font-size: 0.95rem; font-weight: 600; letter-spacing: 0.05em; }
 .llm-section-title::before { width: 3px; height: 1.05rem; border-radius: 3px; background: linear-gradient(var(--llm-gold), var(--llm-accent)); content: ''; }
 
+.llm-runtime-note {
+    padding: 0.75rem 0.9rem;
+    border: 1px solid rgb(154 120 255 / 20%);
+    border-radius: 11px;
+    background: rgb(114 83 220 / 8%);
+    color: #b8b5c8;
+    font-size: 0.8rem;
+    line-height: 1.55;
+}
+
+.llm-runtime-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
+.llm-runtime-card {
+    position: relative;
+    min-width: 0;
+    padding: 0.8rem 0.9rem 0.85rem;
+    border: 1px solid var(--llm-border);
+    border-radius: 11px;
+    background: linear-gradient(145deg, rgb(23 26 36 / 82%), rgb(14 17 24 / 88%));
+}
+
+.llm-runtime-effect { border-color: rgb(229 143 108 / 38%); background: linear-gradient(145deg, rgb(54 31 30 / 48%), rgb(18 18 25 / 90%)); }
+.llm-runtime-label { display: block; margin-bottom: 0.38rem; color: var(--llm-accent-bright); font-size: 0.76rem; font-weight: 600; letter-spacing: 0.04em; }
+.llm-runtime-effect .llm-runtime-label { color: #f0b293; }
+.llm-runtime-value { color: #d5d6df; font-size: 0.86rem; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+
 .llm-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; }
 #legacy-life-manager-root .menu_button {
     min-height: 40px;
@@ -396,6 +421,7 @@
     .llm-silhouette::after { top: 29px; left: -13px; width: 60px; height: 38px; }
     .llm-hero-quote { display: none; }
     .llm-summary-grid { grid-template-columns: 1fr; }
+    .llm-runtime-list { grid-template-columns: 1fr; }
     .llm-actions > button { flex: 1 1 100%; }
 }
 

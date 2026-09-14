@@ -20,6 +20,7 @@ import {
     mergeLifeRecords,
     normalizeEntries,
     parseCarrierCard,
+    replayDynamicStatData,
     rebuildConversationLives,
     safeFilename,
     stableTextFingerprint,
@@ -90,6 +91,12 @@ function latestMessageIndex() {
 const mvu = createMvuAdapter({ env: globalThis, getContext: context, getLatestMessageIndex: latestMessageIndex });
 const readStatData = () => mvu.readStatData();
 const writeMessagePath = (path, value) => mvu.writeMessagePath(path, value);
+
+function readEffectiveStatData() {
+    const messages = context()?.chat || [];
+    const bodyStart = Math.max(0, Number(currentImportedBody()?.startMessageIndex || 0));
+    return replayDynamicStatData(readStatData(), messages, { startIndex: bodyStart });
+}
 
 function mergeLives(data, incoming) {
     data.lives = mergeLifeRecords(data.lives, incoming);
@@ -193,6 +200,9 @@ function currentImportedBody() {
 
 function dynamicContextText(statData) {
     const main = asObject(statData?.主角);
+    const namedBodyChanges = Object.fromEntries(Object.entries(main).filter(([key]) =>
+        /变异|改造|变化|形态|义体|植入|器官|血脉|身体/.test(key)
+        && !['换身状态'].includes(key)));
     return JSON.stringify({
         当前地点: getPath(statData, '世界.地点', ''),
         种族: main.种族,
@@ -204,9 +214,8 @@ function dynamicContextText(statData) {
         法力值: main.法力值,
         体力值: main.体力值,
         状态效果: main.状态效果,
-        当前穿着: main.载体档案?.当前穿着,
-        当前处境: main.载体档案?.当前地点与处境,
-        伤病与健康: main.载体档案?.伤病与健康,
+        实时载体档案: main.载体档案,
+        ...namedBodyChanges,
     }, null, 2);
 }
 
@@ -221,7 +230,8 @@ async function updateCurrentBodyPrompt() {
     const ctx = context();
     if (typeof ctx?.setExtensionPrompt !== 'function') return;
     reconcileConversation({ reason: '生成前校验' });
-    const prompt = buildCurrentBodyPrompt(currentImportedBody(), readStatData(), settings().injectionMode || 'full');
+    const { statData } = readEffectiveStatData();
+    const prompt = buildCurrentBodyPrompt(currentImportedBody(), statData, settings().injectionMode || 'full');
     await ctx.setExtensionPrompt(PROMPT_KEY, prompt, 1, 0, false, 0);
 }
 
@@ -264,7 +274,7 @@ async function verifyWorldBook(name, title, content) {
 
 async function archivePendingLife() {
     const ctx = context();
-    const statData = readStatData();
+    const { statData } = readEffectiveStatData();
     const state = getPath(statData, '主角.换身状态', {});
     const content = String(state?.待归档人生词条 || '').trim();
     if (!content || state?.归档写入状态 !== '待写入世界书') {
@@ -303,7 +313,7 @@ async function archivePendingLife() {
 
 async function exportBackup() {
     const ctx = context();
-    const statData = readStatData();
+    const { statData } = readEffectiveStatData();
     const name = currentWorldBookName();
     const book = name ? await ctx?.loadWorldInfo?.(name) : null;
     const transcript = (ctx?.chat || []).map((message, index) => ({
@@ -404,8 +414,8 @@ async function clearCurrentChatLedger() {
 
 function renderFullBody(panel, body) {
     if (!body?.text) return;
-    const heading = el('h3', 'llm-section-title', '完整当前身体档案');
-    const intro = el('div', 'llm-muted', '界面按板块展示，插件仍保存完整人物卡原文；AI 注入不受板块展开状态影响。');
+    const heading = el('h3', 'llm-section-title', '接管时的完整身体档案');
+    const intro = el('div', 'llm-muted', '这里保留接管时的完整人物卡原文；伤势、变异、改造、形态和穿着等后续变化，以上方“正文实时身体状态”为准。');
     const sections = el('div', 'llm-sections');
     for (const section of body.sections || carrierCardSections(body.rawCard)) {
         const details = document.createElement('details');
@@ -419,6 +429,53 @@ function renderFullBody(panel, body) {
     panel.append(heading, intro, sections, raw);
 }
 
+function runtimeValueText(value) {
+    if (value == null || value === '') return '';
+    if (Array.isArray(value)) return value.map(runtimeValueText).filter(Boolean).join('、');
+    if (typeof value !== 'object') return String(value);
+    return Object.entries(value)
+        .map(([key, item]) => `${key}：${runtimeValueText(item)}`)
+        .filter(line => !line.endsWith('：'))
+        .join(' · ');
+}
+
+function renderRuntimeBodyState(panel, statData, runtimeInfo = {}) {
+    const main = asObject(statData?.主角);
+    const carrier = asObject(main.载体档案);
+    const effects = Object.entries(asObject(main.状态效果));
+    const changes = [];
+    const wanted = /伤|病|健康|外貌|身体|体型|皮肤|四肢|器官|变异|改造|形态|植入|义体|血脉|特征|穿着/;
+    for (const [key, value] of Object.entries(carrier)) {
+        if (wanted.test(key) && runtimeValueText(value)) changes.push([key, value]);
+    }
+    for (const [key, value] of Object.entries(main)) {
+        if (key !== '载体档案' && key !== '状态效果' && wanted.test(key) && runtimeValueText(value)) changes.push([key, value]);
+    }
+    if (!effects.length && !changes.length && !runtimeInfo.appliedOperations) return;
+
+    panel.append(el('h3', 'llm-section-title', '正文实时身体状态'));
+    const note = runtimeInfo.appliedOperations
+        ? `已从最新正文的变量更新中补全 ${runtimeInfo.appliedOperations} 项变化；当 MVU 楼层快照延迟或路径使用“最新动态”别名时仍会立即显示。`
+        : '伤势、状态、变异、改造、形态和穿着会随最新正文变量更新。';
+    panel.append(el('div', 'llm-runtime-note', note));
+    const list = el('div', 'llm-runtime-list');
+    for (const [name, value] of effects) {
+        const card = el('article', 'llm-runtime-card llm-runtime-effect');
+        card.append(el('span', 'llm-runtime-label', `状态效果 · ${name}`), el('div', 'llm-runtime-value', runtimeValueText(value) || '已生效'));
+        list.append(card);
+    }
+    const seen = new Set();
+    for (const [name, value] of changes) {
+        const signature = `${name}:${runtimeValueText(value)}`;
+        if (seen.has(signature)) continue;
+        seen.add(signature);
+        const card = el('article', 'llm-runtime-card');
+        card.append(el('span', 'llm-runtime-label', name), el('div', 'llm-runtime-value', runtimeValueText(value)));
+        list.append(card);
+    }
+    panel.append(list);
+}
+
 function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -426,7 +483,7 @@ function el(tag, className, text) {
     return node;
 }
 
-function renderCurrent(panel, statData) {
+function renderCurrent(panel, statData, runtimeInfo = {}) {
     const messages = context()?.chat || [];
     const importedBody = currentImportedBody();
     const confirmedProfile = confirmedCarrierProfile(messages);
@@ -488,6 +545,7 @@ function renderCurrent(panel, statData) {
         panel.append(warning);
     }
     panel.append(details);
+    renderRuntimeBodyState(panel, statData, runtimeInfo);
     renderFullBody(panel, importedBody);
 }
 
@@ -656,18 +714,20 @@ async function render() {
         panel.append(el('div', 'llm-empty', '请先打开一个角色聊天或群聊。'));
         return;
     }
-    const statData = readStatData();
+    reconcileConversation({ reason: '打开或刷新聊天' });
+    const runtimeInfo = readEffectiveStatData();
+    const statData = runtimeInfo.statData;
     if (!Object.keys(asObject(statData)).length) {
         panel.append(el('div', 'llm-warning', '没有检测到 stat_data；身份与历代人生仍会尝试从已确认的正文人物卡读取。'));
     }
-    reconcileConversation({ reason: '打开或刷新聊天' });
     if (sync) {
         const hasBody = Boolean(currentImportedBody());
-        sync.textContent = hasBody ? '已同步' : '等待人物卡';
+        sync.textContent = hasBody ? (runtimeInfo.appliedOperations ? '正文已追踪' : '已同步') : '等待人物卡';
         sync.dataset.state = hasBody ? 'synced' : 'empty';
+        sync.title = runtimeInfo.appliedOperations ? `已从最新正文补全 ${runtimeInfo.appliedOperations} 项动态变化` : '';
     }
     capturePendingSnapshot(statData);
-    if (tab === 'current') renderCurrent(panel, statData);
+    if (tab === 'current') renderCurrent(panel, statData, runtimeInfo);
     if (tab === 'lives') await renderLives(panel, statData);
     if (tab === 'settings') renderSettings(panel);
 }
@@ -729,7 +789,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.3.0 已加载');
+    console.log('[历代人生管理器] v0.4.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

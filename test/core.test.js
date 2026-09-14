@@ -17,6 +17,7 @@ import {
     extractCarrierCards,
     extractCharacterCard,
     extractCharacterCards,
+    extractJsonPatchOperations,
     getPath,
     initialPlayerProfile,
     inferredLivesFromCarrierCard,
@@ -30,6 +31,7 @@ import {
     formatSummaryValue,
     safeFilename,
     parseCarrierCard,
+    replayDynamicStatData,
     rebuildConversationLives,
     responseSummaries,
     stableTextFingerprint,
@@ -46,6 +48,37 @@ test('asObject parses JSON and rejects arrays', () => {
 test('getPath reads Chinese dotted paths', () => {
     assert.equal(getPath({ 主角: { 等级: 2 } }, '主角.等级'), 2);
     assert.equal(getPath({}, '主角.等级', 'x'), 'x');
+});
+
+test('replays latest-dynamic alias patches into the current protagonist view', () => {
+    const response = `<UpdateVariable><JSONPatch>[
+      {"op":"replace","path":"/最新动态/生命值/当前","value":391},
+      {"op":"add","path":"/最新动态/状态效果/小腿割伤","value":{"描述":"左小腿被小刀划伤","效果":"轻微渗血","持续":"未处理"}},
+      {"op":"add","path":"/主角/载体档案/身体改造","value":"左臂魔导义体"}
+    ]</JSONPatch></UpdateVariable>`;
+    assert.equal(extractJsonPatchOperations(response).length, 3);
+    const result = replayDynamicStatData({
+        主角: {
+            生命值: { 当前: 0, 上限: { _基础: 413, 额外: 0 } },
+            状态效果: {},
+            载体档案: { 姓名: '纳蕾' },
+        },
+    }, [{ is_user: false, mes: response }]);
+    assert.equal(result.appliedOperations, 3);
+    assert.equal(result.statData.主角.生命值.当前, 391);
+    assert.equal(result.statData.主角.状态效果.小腿割伤.持续, '未处理');
+    assert.equal(result.statData.主角.载体档案.身体改造, '左臂魔导义体');
+});
+
+test('dynamic replay ignores unrelated roots, user messages and unsafe pointers', () => {
+    const messages = [
+        { is_user: true, mes: '<JSONPatch>[{"op":"replace","path":"/主角/等级","value":99}]</JSONPatch>' },
+        { is_user: false, mes: '<JSONPatch>[{"op":"replace","path":"/新闻/内容","value":"x"},{"op":"add","path":"/主角/__proto__/polluted","value":true}]</JSONPatch>' },
+    ];
+    const result = replayDynamicStatData({ 主角: { 等级: 1 } }, messages);
+    assert.equal(result.appliedOperations, 0);
+    assert.equal(result.statData.主角.等级, 1);
+    assert.equal({}.polluted, undefined);
 });
 
 test('normalizeStage accepts only protocol stages', () => {
@@ -406,6 +439,18 @@ test('currentBodySummary merges a legacy chat character card without replacing l
         身份: '无', 职业: '无（原世界学生）', 地点: '城防值班室',
         健康: '生命值 206/206 · 无状态效果',
     });
+});
+
+test('currentBodySummary lets live injuries override a stale healthy carrier description', () => {
+    const result = currentBodySummary({
+        主角: {
+            载体档案: { 姓名: '纳蕾', 伤病与健康: '身体健康，无伤病。' },
+            生命值: { 当前: 391, 上限: { _基础: 413, 额外: 0 } },
+            状态效果: { 小腿割伤: { 效果: '轻微渗血' } },
+        },
+    });
+    const health = Object.fromEntries(result.rows).健康;
+    assert.equal(health, '生命值 391/413 · 状态：小腿割伤');
 });
 
 test('statDataFromVariables reads object and JSON forms', () => {
