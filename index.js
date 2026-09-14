@@ -8,15 +8,18 @@ import {
     carrierCardSections,
     carrierCardText,
     carrierRecordKey,
+    compactLifeIndex,
     confirmedCarrierProfile,
     confirmedCarrierRecords,
     conversationLedgerTruth,
+    currentBehaviorProfile,
     currentBodySummary,
     detectCarryover,
     extractCarrierCards,
     getPath,
     inferredLivesFromCarrierCard,
     lifeHistorySummaries,
+    liveBodyState,
     mergeLifeRecords,
     normalizeEntries,
     parseCarrierCard,
@@ -24,6 +27,7 @@ import {
     rebuildConversationLives,
     safeFilename,
     stableTextFingerprint,
+    smartInjectionUsesFullCard,
     supplementalPlayerProfile,
     upsertArchive,
 } from './core.js';
@@ -32,9 +36,10 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 3, injectionMode: 'full' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 5, injectionMode: 'smart' });
 let initialized = false;
 let refreshTimers = [];
+let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'smart', effectiveMode: '等待当前身体' };
 
 function context() {
     return globalThis.SillyTavern?.getContext?.();
@@ -44,18 +49,27 @@ function settings() {
     const ctx = context();
     if (!ctx) return { ...DEFAULT_SETTINGS };
     ctx.extensionSettings[EXTENSION_KEY] ??= { ...DEFAULT_SETTINGS };
-    return ctx.extensionSettings[EXTENSION_KEY];
+    const current = ctx.extensionSettings[EXTENSION_KEY];
+    if (Number(current.dataVersion || 0) < 5) {
+        // 0.4.x and earlier defaulted to full. Migrate that legacy default once;
+        // users can still explicitly select full again after the upgrade.
+        if (!current.injectionMode || current.injectionMode === 'full') current.injectionMode = 'smart';
+        current.dataVersion = 5;
+        ctx.saveSettingsDebounced?.();
+    }
+    if (!['smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'smart';
+    return current;
 }
 
 function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 4, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 5, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
-        data.version = 4;
+        data.version = 5;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -198,32 +212,48 @@ function currentImportedBody() {
     return chatData(false)?.currentBody || null;
 }
 
-function dynamicContextText(statData) {
-    const main = asObject(statData?.主角);
-    const namedBodyChanges = Object.fromEntries(Object.entries(main).filter(([key]) =>
-        /变异|改造|变化|形态|义体|植入|器官|血脉|身体/.test(key)
-        && !['换身状态'].includes(key)));
-    return JSON.stringify({
-        当前地点: getPath(statData, '世界.地点', ''),
-        种族: main.种族,
-        身份: main.身份,
-        职业: main.职业,
-        等级: main.等级,
-        属性: main.属性,
-        生命值: main.生命值,
-        法力值: main.法力值,
-        体力值: main.体力值,
-        状态效果: main.状态效果,
-        实时载体档案: main.载体档案,
-        ...namedBodyChanges,
-    }, null, 2);
+function dynamicContextText(statData, fullCarrier = false) {
+    return JSON.stringify(liveBodyState(statData, { fullCarrier }), null, 2);
 }
 
 function buildCurrentBodyPrompt(body, statData, mode) {
-    if (!body || mode === 'off') return '';
+    if (!body || mode === 'off') return { prompt: '', effectiveMode: body ? '已关闭' : '等待当前身体' };
+    const messages = context()?.chat || [];
     const profile = JSON.stringify(body.profile || {}, null, 2);
-    const details = mode === 'full' ? body.text : profile;
-    return `<legacy_life_current_body>\n这是已经由现实Participant确认并由“历代人生管理器”保存的当前身体档案。它是当前人物设定，不是候选，也不是前世。不得把历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性混入当前身体；不得据此代替Participant生成台词、内心、动作、决定或选择。地点、资源、伤势、状态与穿着等易变信息，以“最新动态”优先。\n\n【完整当前身体档案】\n${details}\n\n【最新动态】\n${dynamicContextText(statData)}\n</legacy_life_current_body>`;
+    const behavior = JSON.stringify(currentBehaviorProfile(body.rawCard || body.text, statData), null, 2);
+    const firstSmartTurn = mode === 'smart' && smartInjectionUsesFullCard(body, messages);
+    const useFullCard = mode === 'full' || firstSmartTurn;
+    const details = useFullCard ? body.text : profile;
+    const detailTitle = useFullCard ? '完整当前身体档案' : '当前身体核心档案';
+    const histories = (mode === 'smart' && !firstSmartTurn) || mode === 'compact'
+        ? compactLifeIndex(mergeLifeRecords(chatData(false)?.lives || [], inferredLivesFromCarrierCard(body.rawCard)), 1200)
+        : '';
+    const historySection = histories
+        ? `\n\n【历代经历压缩索引】\n以下只是历代重要经历记忆，不代表旧人格、感情、知识、技能或属性继承。\n${histories}`
+        : '';
+    const effectiveMode = mode === 'smart'
+        ? (firstSmartTurn ? '智能·换身首轮完整' : '智能·日常精简')
+        : mode === 'full' ? '完整' : '精简';
+    const prompt = `<legacy_life_current_body>\n这是现实Participant已经确认、由“历代人生管理器”保存的当前身体档案。它是当前有效人物设定，不是候选，也不是前世。历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性不得回流；地点、资源、伤势、状态、身体变化与穿着等易变信息，以“正文实时状态”优先。\n\n【行动—人格协调规则｜每轮强制执行】\n- Participant输入决定“做什么”及最终选择；只要客观上可能，当前身体性格与恐惧不得否决、取消、偷换或强制判定该行动失败。\n- 当前身体的性格、价值观、感情、喜恶、愿望、恐惧、习惯、认知边界与思维方式决定“如何理解和执行”：注意力、风险评估、计划习惯、犹豫或决心、非意志性生理反应、语气与动作节奏都应一致。胆小者可以执行勇敢行动，但可在不撤销行动的前提下体现恐惧、谨慎准备、迟疑或身体紧张。\n- Recorder只能为实现Participant已明确内容，补充最低限度且不改变意图的当下体验与执行质感；不得新增目标、选择、台词、后续主动行动或替Participant改变决定。当前人格造成的是可信阻力与代价，不是行动否决权。\n- 思考与感知必须使用当前身体的词汇、知识边界、价值排序、认知习惯和身体经验；除已归档的重要经历记忆外，不得泄露历代旧人格或旧知识。\n\n【当前人格与思维方式｜每轮有效】\n${behavior}\n\n【${detailTitle}】\n${details}\n\n【正文实时状态】\n${dynamicContextText(statData, mode === 'full')}${historySection}\n</legacy_life_current_body>`;
+    return { prompt, effectiveMode };
+}
+
+function recordPromptStats(prompt, requestedMode, effectiveMode) {
+    const characters = prompt.length;
+    lastPromptStats = {
+        characters,
+        tokenLow: characters ? Math.ceil(characters * 0.5) : 0,
+        tokenHigh: characters,
+        requestedMode,
+        effectiveMode,
+    };
+    const meter = document.querySelector('#legacy-life-manager-root .llm-prompt-meter');
+    if (meter) meter.textContent = promptStatsText();
+}
+
+function promptStatsText() {
+    const stats = lastPromptStats;
+    return `当前实际注入：${stats.effectiveMode} · ${stats.characters.toLocaleString()} 字符 · 约 ${stats.tokenLow.toLocaleString()}–${stats.tokenHigh.toLocaleString()} Token`;
 }
 
 async function updateCurrentBodyPrompt() {
@@ -231,8 +261,10 @@ async function updateCurrentBodyPrompt() {
     if (typeof ctx?.setExtensionPrompt !== 'function') return;
     reconcileConversation({ reason: '生成前校验' });
     const { statData } = readEffectiveStatData();
-    const prompt = buildCurrentBodyPrompt(currentImportedBody(), statData, settings().injectionMode || 'full');
-    await ctx.setExtensionPrompt(PROMPT_KEY, prompt, 1, 0, false, 0);
+    const requestedMode = settings().injectionMode || 'smart';
+    const built = buildCurrentBodyPrompt(currentImportedBody(), statData, requestedMode);
+    await ctx.setExtensionPrompt(PROMPT_KEY, built.prompt, 1, 0, false, 0);
+    recordPromptStats(built.prompt, requestedMode, built.effectiveMode);
 }
 
 function currentWorldBookName() {
@@ -605,7 +637,12 @@ function renderSettings(panel) {
     const injectionLabel = el('label', 'llm-label', '发送给 AI 的当前身体资料');
     const injection = document.createElement('select');
     injection.className = 'text_pole';
-    for (const [value, text] of [['full', '完整注入（推荐）'], ['compact', '精简注入'], ['off', '不注入']]) {
+    for (const [value, text] of [
+        ['smart', '智能注入（推荐）'],
+        ['full', '每轮完整注入'],
+        ['compact', '始终精简注入'],
+        ['off', '不注入'],
+    ]) {
         const option = document.createElement('option');
         option.value = value;
         option.textContent = text;
@@ -618,6 +655,8 @@ function renderSettings(panel) {
         updateCurrentBodyPrompt();
     });
     injectionLabel.append(injection);
+    const injectionHelp = el('div', 'llm-muted', '智能模式仅在换身后首轮发送完整人物卡；之后每轮固定发送人格与思维方式、核心身份、完整状态描述、身体变化和限长的历代经历索引。');
+    const promptMeter = el('div', 'llm-prompt-meter', promptStatsText());
 
     const importLabel = el('label', 'llm-label', '从正文选择人物卡');
     const cardSelect = document.createElement('select');
@@ -652,7 +691,7 @@ function renderSettings(panel) {
     const archiveCard = el('section', 'llm-control-card');
     archiveCard.append(label, select, active);
     const aiCard = el('section', 'llm-control-card');
-    aiCard.append(injectionLabel);
+    aiCard.append(injectionLabel, injectionHelp, promptMeter);
     const importCard = el('section', 'llm-control-card');
     importCard.append(importLabel, importActions);
     const maintenanceCard = el('section', 'llm-control-card');
@@ -789,7 +828,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.4.0 已加载');
+    console.log('[历代人生管理器] v0.5.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

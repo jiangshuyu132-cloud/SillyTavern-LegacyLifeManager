@@ -124,6 +124,73 @@ export function replayDynamicStatData(statData = {}, messages = [], options = {}
     return { statData: result, appliedOperations, lastMessageIndex };
 }
 
+const BODY_CHANGE_FIELD = /伤|病|健康|外貌|身体|体型|皮肤|四肢|器官|结构|生理|变异|改造|形态|植入|义体|血脉|特征|疤痕|气味|卫生|体毛|发色|瞳色|身高|体重|尺寸|标记|烙印|诅咒|祝福|穿着/;
+
+export function liveBodyState(statData = {}, options = {}) {
+    const main = asObject(statData?.主角);
+    const carrier = asObject(main.载体档案);
+    const fullCarrier = options?.fullCarrier === true;
+    const carrierChanges = fullCarrier
+        ? carrier
+        : Object.fromEntries(Object.entries(carrier).filter(([key, value]) => BODY_CHANGE_FIELD.test(key) && value != null && value !== ''));
+    const namedBodyChanges = Object.fromEntries(Object.entries(main).filter(([key, value]) =>
+        key !== '载体档案'
+        && key !== '换身状态'
+        && BODY_CHANGE_FIELD.test(key)
+        && value != null
+        && value !== ''));
+    const location = main.当前地点
+        || carrier.当前地点与处境
+        || getPath(statData, '世界.当前地点', '')
+        || getPath(statData, '世界.地点', '');
+    return {
+        当前地点: location,
+        种族: main.种族,
+        身份: main.身份,
+        职业: main.职业,
+        等级: main.等级,
+        属性: main.属性,
+        生命值: main.生命值,
+        法力值: main.法力值,
+        体力值: main.体力值,
+        状态效果: main.状态效果,
+        ...(Object.keys(carrierChanges).length ? { [fullCarrier ? '实时载体档案' : '身体动态变化']: carrierChanges } : {}),
+        ...namedBodyChanges,
+    };
+}
+
+export function smartInjectionUsesFullCard(body, messages = []) {
+    if (!body) return false;
+    const anchor = Number(body.confirmationMessageIndex ?? body.startMessageIndex ?? body.sourceMessageIndex ?? 0);
+    return !messages.slice(Math.max(0, anchor + 1)).some(message => message && !message.is_user && !message.is_system);
+}
+
+export function compactLifeIndex(lives = [], maxChars = 1200) {
+    const limit = Math.max(160, Number(maxChars) || 1200);
+    const records = mergeLifeRecords(lives);
+    const lines = [];
+    let used = 0;
+    let omitted = 0;
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+        const item = records[index];
+        const title = item.title || `第${item.generation}世·${item.name}`;
+        const summary = String(item.summary || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 220);
+        const line = `${title}：${summary || '已存档'}`;
+        if (used + line.length + 1 > limit) {
+            omitted += 1;
+            continue;
+        }
+        lines.push(line);
+        used += line.length + 1;
+    }
+    lines.reverse();
+    if (omitted) lines.unshift(`更早 ${omitted} 世已存档，本轮不展开。`);
+    return lines.join('\n');
+}
+
 export function formatSummaryValue(value, fallback = '当前变量未提供') {
     if (Array.isArray(value)) {
         const text = value.map(item => String(item ?? '').trim()).filter(Boolean).join('、');
@@ -177,7 +244,7 @@ export function currentBodySummary(statData = {}, supplementalProfile = {}, opti
             ['种族', formatSummaryValue(preferSupplemental ? (supplemental.种族 || main.种族) : (hasCarrierProfile ? main.种族 : (supplemental.种族 || main.种族)))],
             ['身份', formatSummaryValue(preferSupplemental ? (supplemental.身份 || main.身份) : (hasCarrierProfile ? main.身份 : (supplemental.身份 || main.身份)), '暂无身份')],
             ['职业', formatSummaryValue(preferSupplemental ? (supplemental.职业 || main.职业) : (hasCarrierProfile ? main.职业 : (supplemental.职业 || main.职业)), '暂无职业')],
-            ['地点', formatSummaryValue(liveProfile.当前地点与处境 || getPath(statData, '世界.地点') || supplemental.地点)],
+            ['地点', formatSummaryValue(main.当前地点 || liveProfile.当前地点与处境 || getPath(statData, '世界.当前地点') || getPath(statData, '世界.地点') || supplemental.地点)],
             ['健康', formatSummaryValue(health)],
         ],
     };
@@ -314,6 +381,45 @@ export function carrierCardText(card) {
         .replace(/\n[ \t]+/g, '\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
+}
+
+const BEHAVIOR_PROFILE_FIELDS = [
+    ['性格与价值观', ['当前原主性格与价值观', '性格与价值观', '人格与价值观']],
+    ['思维方式与认知边界', ['思维方式', '原主完整记忆与认知边界', '原主记忆与认知', '认知边界']],
+    ['情绪模式与当前感情', ['情绪模式', '当前感情', '当前重要感情']],
+    ['喜爱与厌恶', ['喜爱与厌恶', '喜好与厌恶', '喜恶']],
+    ['愿望与恐惧', ['愿望与恐惧']],
+    ['生活与行动习惯', ['生活习惯', '行动习惯', '情绪与生活习惯']],
+    ['当前知识与语言', ['当前知识与语言', '知识与语言']],
+    ['当前技能与身体经验', ['当前技能与能力', '技能与能力', '技能能力']],
+];
+
+/**
+ * Keeps the current carrier's decision lens available without resending the
+ * entire visual card. Live MVU values override the confirmation-time card so
+ * genuine character development can take effect on the next generation.
+ */
+export function currentBehaviorProfile(card, statData = {}) {
+    const carrier = asObject(statData?.主角?.载体档案);
+    const result = {};
+    for (const [target, labels] of BEHAVIOR_PROFILE_FIELDS) {
+        let value = '';
+        for (const label of labels) {
+            const liveValue = carrier[label];
+            if (liveValue != null && liveValue !== '') {
+                value = typeof liveValue === 'string' ? liveValue.trim() : liveValue;
+                break;
+            }
+        }
+        if (!value) {
+            for (const label of labels) {
+                value = carrierField(card, label);
+                if (value) break;
+            }
+        }
+        if (value) result[target] = value;
+    }
+    return result;
 }
 
 export function carrierCardSections(card) {

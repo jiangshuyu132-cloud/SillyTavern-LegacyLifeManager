@@ -9,9 +9,11 @@ import {
     carrierCardSections,
     carrierCardText,
     carrierRecordKey,
+    compactLifeIndex,
     confirmedCarrierProfile,
     confirmedCarrierRecords,
     conversationLedgerTruth,
+    currentBehaviorProfile,
     currentBodySummary,
     detectCarryover,
     extractCarrierCards,
@@ -25,6 +27,7 @@ import {
     lifeHistorySummaries,
     lifeSummariesFromCarrierCard,
     lifeSummariesFromUpdateVariable,
+    liveBodyState,
     mergeLifeRecords,
     normalizeEntries,
     normalizeStage,
@@ -35,6 +38,7 @@ import {
     rebuildConversationLives,
     responseSummaries,
     stableTextFingerprint,
+    smartInjectionUsesFullCard,
     supplementalPlayerProfile,
     upsertArchive,
 } from '../core.js';
@@ -79,6 +83,66 @@ test('dynamic replay ignores unrelated roots, user messages and unsafe pointers'
     assert.equal(result.appliedOperations, 0);
     assert.equal(result.statData.主角.等级, 1);
     assert.equal({}.polluted, undefined);
+});
+
+test('smart injection uses the full card only before the first post-confirmation reply', () => {
+    const body = { confirmationMessageIndex: 1 };
+    assert.equal(smartInjectionUsesFullCard(body, [
+        { is_user: false, mes: '候选卡' },
+        { is_user: true, mes: '确认换身' },
+    ]), true);
+    assert.equal(smartInjectionUsesFullCard(body, [
+        { is_user: false, mes: '候选卡' },
+        { is_user: true, mes: '确认换身' },
+        { is_user: false, mes: '换身后首轮正文' },
+    ]), false);
+});
+
+test('compact life index keeps concise recent histories within its budget', () => {
+    const text = compactLifeIndex([
+        { generation: 1, name: '甲', summary: '甲'.repeat(300) },
+        { generation: 2, name: '乙', summary: '在铁炉堡生活并战死。' },
+    ], 180);
+    assert.ok(text.length <= 220);
+    assert.match(text, /第2世·乙/);
+    assert.match(text, /更早 1 世已存档/);
+});
+
+test('live body state keeps full status descriptions but filters unrelated stable fields', () => {
+    const result = liveBodyState({
+        世界: { 地点: '旧地点' },
+        主角: {
+            当前地点: '洗衣坊',
+            生命值: { 当前: 391, 上限: { _基础: 411, 额外: 0 } },
+            状态效果: { 小腿割伤: { 描述: '小刀划伤', 效果: '渗血', 持续: '未处理' } },
+            载体档案: { 性格与价值观: '谨慎', 当前穿着: '粗麻衣', 身体改造: '左臂魔导义体' },
+            技能: { 洗涤: 3 },
+        },
+    });
+    assert.equal(result.当前地点, '洗衣坊');
+    assert.equal(result.状态效果.小腿割伤.持续, '未处理');
+    assert.equal(result.身体动态变化.身体改造, '左臂魔导义体');
+    assert.equal(result.身体动态变化.性格与价值观, undefined);
+    assert.equal(result.技能, undefined);
+});
+
+test('current behavior profile keeps all decision-lens fields and prefers live development', () => {
+    const card = `
+<b>当前原主性格与价值观：</b>沉默谨慎，但被逼到底线时会固执拒绝。<br>
+<b>思维方式：</b>先确认退路，再处理眼前问题。<br>
+<b>喜恶：</b>喜欢热粥；害怕矿区。<br>
+<b>愿望与恐惧：</b>想租一间小屋；害怕再次被抛下。<br>
+<b>生活习惯：</b>天不亮起床烧水。<br>
+<b>当前感情：</b>对陌生人保持警惕。<br>
+<b>当前知识与语言：</b>只懂本地口语和洗衣工作。<br>
+<b>技能与能力：</b>熟练洗涤，战斗经验很少。<br>`;
+    const result = currentBehaviorProfile(card, {
+        主角: { 载体档案: { 性格与价值观: '经历危机后仍谨慎，但更愿意主动求助。' } },
+    });
+    assert.equal(result.性格与价值观, '经历危机后仍谨慎，但更愿意主动求助。');
+    assert.equal(result.思维方式与认知边界, '先确认退路，再处理眼前问题。');
+    assert.match(result.愿望与恐惧, /再次被抛下/);
+    assert.match(result.当前技能与身体经验, /战斗经验很少/);
 });
 
 test('normalizeStage accepts only protocol stages', () => {

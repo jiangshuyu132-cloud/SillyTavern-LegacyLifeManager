@@ -355,6 +355,17 @@
 .llm-runtime-effect .llm-runtime-label { color: #f0b293; }
 .llm-runtime-value { color: #d5d6df; font-size: 0.86rem; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
 
+.llm-prompt-meter {
+    padding: 0.7rem 0.8rem;
+    border: 1px solid rgb(79 211 160 / 25%);
+    border-radius: 9px;
+    background: rgb(30 73 61 / 18%);
+    color: #a9dcc8;
+    font-size: 0.78rem;
+    font-weight: 500;
+    line-height: 1.5;
+}
+
 .llm-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; }
 #legacy-life-manager-root .menu_button {
     min-height: 40px;
