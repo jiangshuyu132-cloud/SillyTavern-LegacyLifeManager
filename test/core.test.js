@@ -207,6 +207,14 @@ const actualCarrierCardVariant = `【当前载体人物设定开始】
 历代旧人格均未继承。</div>
 【当前载体人物设定结束】`;
 
+// Fixtures now carry actual before/after MVU snapshots; text alone is not a commit.
+function confirmedFixture(card=carrierCard, stamp='1') {
+    const profile=parseCarrierCard(extractCarrierCards(card)[0]);
+    const before={主角:{载体档案:{姓名:'江书宇'},换身状态:{阶段:'等待确认',当前身体死亡已确认:true,当前世代编号:1,待确认人物卡:card,当前身体死亡信息:'已死亡',待归档人生词条:'',归档写入状态:'无待处理'}},历代记忆摘要:[]};
+    const after={主角:{载体档案:profile,换身状态:{阶段:'当前身体生效',当前身体死亡已确认:false,当前世代编号:2,待确认人物卡:'',当前身体死亡信息:'',待归档人生词条:'词条名称: 第1世·江书宇\n经历',归档写入状态:'待写入世界书'}},历代记忆摘要:[{世代编号:1,身体姓名:'江书宇',详细词条名称:'第1世·江书宇'}]};
+    return [{is_user:false,mes:card,send_date:'card-'+stamp,stat_data:before},{is_user:true,mes:'确认换身',send_date:'confirm-'+stamp},{is_user:false,mes:'客观感官交接。',stat_data:after}];
+}
+
 test('parseCarrierCard reads the HTML carrier format used by the story', () => {
     const [card] = extractCarrierCards(carrierCard);
     assert.deepEqual(parseCarrierCard(card), {
@@ -224,32 +232,30 @@ test('parseCarrierCard reads the HTML carrier format used by the story', () => {
 
 test('confirmedCarrierProfile uses only the latest card followed by exact confirmation', () => {
     const messages = [
-        { is_user: false, mes: carrierCard },
-        { is_user: true, mes: '确认换身' },
+        ...confirmedFixture(),
         { is_user: false, mes: carrierCard.replaceAll('若莎·阿泽恩（Zhosha Adzern）', '未确认的新候选') },
     ];
     assert.equal(confirmedCarrierRecords(messages).length, 1);
     assert.equal(confirmedCarrierProfile(messages).姓名, '若莎·阿泽恩（Zhosha Adzern）');
 });
 
-test('confirmation recognizes the preset explanatory option without accepting discussion', () => {
+test('confirmation rejects explanatory options and discussion', () => {
     assert.equal(isCarrierConfirmation('确认换身'), true);
-    assert.equal(isCarrierConfirmation('发送“确认换身”，正式接管朵丽的身体，开始第二世的生活'), true);
+    assert.equal(isCarrierConfirmation('发送“确认换身”，正式接管朵丽的身体，开始第二世的生活'), false);
     assert.equal(isCarrierConfirmation('我想问问“确认换身”是什么意思'), false);
 });
 
-test('confirmed carrier records accept the legacy explanatory option', () => {
+test('legacy explanatory option cannot commit a candidate', () => {
     const messages = [
         { is_user: false, mes: carrierCard },
         { is_user: true, mes: '发送"确认换身"，正式接管若莎的身体，开始第二世的生活' },
     ];
-    assert.equal(confirmedCarrierProfile(messages).姓名, '若莎·阿泽恩（Zhosha Adzern）');
+    assert.equal(confirmedCarrierProfile(messages).姓名, undefined);
 });
 
 test('conversation ledger truth disappears when card and confirmation floors are deleted', () => {
     const confirmed = [
-        { is_user: false, mes: carrierCard, send_date: 'card-1' },
-        { is_user: true, mes: '确认换身', send_date: 'confirm-1' },
+        ...confirmedFixture(carrierCard,'1'),
     ];
     const truth = conversationLedgerTruth(confirmed);
     assert.equal(truth.currentRecord.profile.姓名, '若莎·阿泽恩（Zhosha Adzern）');
@@ -264,16 +270,14 @@ test('conversation ledger truth disappears when card and confirmation floors are
 
 test('cleared confirmations stay suppressed without blocking a newly generated confirmation', () => {
     const first = [
-        { is_user: false, mes: carrierCard, send_date: 'card-1' },
-        { is_user: true, mes: '确认换身', send_date: 'confirm-1' },
+        ...confirmedFixture(carrierCard,'1'),
     ];
     const firstRecord = confirmedCarrierRecords(first)[0];
     const suppressedKey = carrierRecordKey(firstRecord, first);
     assert.equal(conversationLedgerTruth(first, [suppressedKey]).currentRecord, null);
 
     const regenerated = [
-        { is_user: false, mes: carrierCard, send_date: 'card-2' },
-        { is_user: true, mes: '确认换身', send_date: 'confirm-2' },
+        ...confirmedFixture(carrierCard,'2'),
     ];
     const regeneratedRecord = confirmedCarrierRecords(regenerated)[0];
     assert.notEqual(suppressedKey, carrierRecordKey(regeneratedRecord, regenerated));
@@ -284,8 +288,7 @@ test('carrier fingerprints and generation parsing are deterministic', () => {
     assert.equal(stableTextFingerprint(carrierCard), stableTextFingerprint(`\r${carrierCard}\r`));
     assert.equal(carrierGeneration(extractCarrierCards(carrierCard)[0]), 2);
     assert.equal(rebuildConversationLives([
-        { is_user: false, mes: carrierCard },
-        { is_user: true, mes: '确认换身' },
+        ...confirmedFixture(),
     ])[0].name, '江书宇');
 });
 
@@ -330,7 +333,7 @@ test('actual v2 heading and colon format recovers the complete previous-life sum
     assert.match(life.summary, /死亡原因：流矢穿颅/);
 });
 
-test('confirmed response JSONPatch recovers a legacy summary even when MVU drops the custom field', () => {
+test('partial JSONPatch is extractable history text but cannot prove an MVU commit', () => {
     const response = `<UpdateVariable><JSONPatch>[{
       "op":"insert",
       "path":"/历代记忆摘要/-",
@@ -345,11 +348,11 @@ test('confirmed response JSONPatch recovers a legacy summary even when MVU drops
         { is_user: true, mes: '确认换身' },
         { is_user: false, mes: response },
     ]);
-    assert.equal(truth.currentRecord.profile.姓名, '忒娜·厄尔伯');
-    assert.equal(truth.lives[0].title, '第1世·江书宇');
+    assert.equal(truth.currentRecord, null);
+    assert.deepEqual(truth.lives, []);
 });
 
-test('generation two confirmation can fall back to the opening profile and narrative summaries', () => {
+test('narrative death and confirmation without real state cannot fabricate a commit', () => {
     const noHistoryCard = actualCarrierCardVariant.replace(/<b>===== 历代经历记忆 =====<\/b>[\s\S]*?<b>===== 不继承声明 =====<\/b>/, '<b>===== 不继承声明 =====</b>');
     const lives = rebuildConversationLives([
         { is_user: true, mes: '姓名: 江书宇\n身份: 异世界来客\n性别: 男\n年龄: 16岁' },
@@ -357,8 +360,7 @@ test('generation two confirmation can fall back to the opening profile and narra
         { is_user: false, mes: noHistoryCard },
         { is_user: true, mes: '确认换身' },
     ]);
-    assert.equal(lives[0].title, '第1世·江书宇');
-    assert.match(lives[0].summary, /来到铁炉堡/);
+    assert.deepEqual(lives, []);
 });
 
 test('manual current-body data cannot overwrite recovered life records with an empty list', () => {
@@ -394,7 +396,7 @@ test('life history renders concise summaries and ignores protocol/template entri
         source: 'confirmed-card',
     }]);
     const result = lifeHistorySummaries(
-        [{ is_user: false, mes: carrierCard }, { is_user: true, mes: '确认换身' }],
+        confirmedFixture(),
         {},
         [
             { comment: '[历代记忆档案]【常驻规则】档案协议', content: '不是人生' },

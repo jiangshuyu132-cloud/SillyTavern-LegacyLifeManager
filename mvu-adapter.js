@@ -148,5 +148,34 @@ export function createMvuAdapter({ env = globalThis, getContext, getLatestMessag
         await Promise.resolve(ctx.saveChat?.());
     }
 
-    return { readStatData, writeMessagePath };
+    function readStatDataAt(index) {
+        const opt = { type: 'message', message_id: index };
+        const getter = callable(env, 'getVariables');
+        if (getter) { try { const data=statDataFromVariables(getter.fn.call(getter.owner,opt)); if(data) return data; } catch {} }
+        if (typeof env?.Mvu?.getMvuData === 'function') { try { const data=statDataFromVariables(env.Mvu.getMvuData(opt)); if(data) return data; } catch {} }
+        return statDataFromMessage(getContext()?.chat?.[index]);
+    }
+    async function completeArchive({ messageIndex, chatId, draft, generation, assertContext }) {
+        const opt = { type: 'message', message_id: messageIndex };
+        const transform = variables => {
+            assertContext();
+            const stat = statDataFromVariables(variables);
+            const state=stat?.主角?.换身状态;
+            if (!state || state.当前世代编号 !== generation+1 || state.待归档人生词条 !== draft || state.归档写入状态 !== '待写入世界书') throw new Error('归档期间MVU草稿或世代改变，已保留当前资料');
+            const next=clone(variables,env);
+            next.stat_data.主角.换身状态.归档写入状态='已写入世界书';
+            next.stat_data.主角.换身状态.待归档人生词条='';
+            return next;
+        };
+        const updater=callable(env,'updateVariablesWith');
+        if (updater) { await Promise.resolve(updater.fn.call(updater.owner,transform,opt)); return; }
+        const getter=callable(env,'getVariables'), replacer=callable(env,'replaceVariables');
+        if (getter && replacer) { const next=transform(getter.fn.call(getter.owner,opt)); await Promise.resolve(replacer.fn.call(replacer.owner,next,opt)); return; }
+        if (typeof env?.Mvu?.getMvuData === 'function' && typeof env?.Mvu?.replaceMvuData === 'function') {
+            const next=transform(env.Mvu.getMvuData(opt)); await Promise.resolve(env.Mvu.replaceMvuData(next,opt)); return;
+        }
+        // A latest-only API cannot safely clear a captured draft after asynchronous I/O.
+        throw new Error('缺少按消息地址写入的MVU接口，世界书已保留；草稿不自动清空，请升级酒馆助手后重试');
+    }
+    return { readStatData, readStatDataAt, writeMessagePath, completeArchive };
 }

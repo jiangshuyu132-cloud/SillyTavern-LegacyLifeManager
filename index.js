@@ -1,3 +1,4 @@
+import { archiveGate, specialGeneration, messageStat, protocolTimeline } from './strict-protocol.js';
 import {
     ARCHIVE_PREFIX,
     archiveKeywords,
@@ -23,7 +24,6 @@ import {
     mergeLifeRecords,
     normalizeEntries,
     parseCarrierCard,
-    replayDynamicStatData,
     rebuildConversationLives,
     safeFilename,
     stableTextFingerprint,
@@ -38,6 +38,7 @@ const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
 const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 5, injectionMode: 'smart' });
 let initialized = false;
+let archiveInFlight = false;
 let refreshTimers = [];
 let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'smart', effectiveMode: '等待当前身体' };
 
@@ -69,6 +70,12 @@ function chatData(create = true) {
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
+        if (data.protocolVersion !== 'dusk.1') {
+            // Permanent one-time copy: stricter proof must not destroy a legacy ledger.
+            data.legacyMigrationBackup ??= {at:new Date().toISOString(),data:structuredClone(data)};
+            data.protocolVersion='dusk.1';
+            ctx.saveMetadataDebounced?.();
+        }
         data.version = 5;
         data.lives ??= [];
         data.currentBody ??= null;
@@ -104,44 +111,25 @@ function latestMessageIndex() {
 
 const mvu = createMvuAdapter({ env: globalThis, getContext: context, getLatestMessageIndex: latestMessageIndex });
 const readStatData = () => mvu.readStatData();
-const writeMessagePath = (path, value) => mvu.writeMessagePath(path, value);
+
+function protocolMessages() {
+    return (context()?.chat || []).map((message,index) => {
+        if (messageStat(message)) return message;
+        const stat=mvu.readStatDataAt(index);
+        return stat ? {...message, stat_data:stat} : message;
+    });
+}
 
 function readEffectiveStatData() {
-    const messages = context()?.chat || [];
-    const bodyStart = Math.max(0, Number(currentImportedBody()?.startMessageIndex || 0));
-    return replayDynamicStatData(readStatData(), messages, { startIndex: bodyStart });
+    const messages = protocolMessages();
+    // Only persisted snapshots may drive current-body injection; text patches are not proof.
+    // Confirmation/archiving still require the separate verified transaction chain.
+    const statData=protocolTimeline(messages,{storedOnly:true}).at(-1) || {};
+    return {statData:Object.keys(statData).length ? statData : readStatData(), appliedOperations:0, lastMessageIndex:messages.length-1};
 }
 
 function mergeLives(data, incoming) {
     data.lives = mergeLifeRecords(data.lives, incoming);
-}
-
-function saveImportedBody(card, profile, messageIndex, mode = 'sync', sourceType = 'manual') {
-    const data = chatData();
-    const messages = context()?.chat || [];
-    const previous = data.currentBody;
-    const inferred = inferredLivesFromCarrierCard(card);
-    mergeLives(data, inferred);
-    const generation = carrierGeneration(card, Math.max(1, ...data.lives.map(item => Number(item.generation) + 1).filter(Number.isFinite)));
-    if (mode === 'confirm' && previous && previous.profile?.姓名 !== profile.姓名) {
-        mergeLives(data, [buildLifeRecord(previous, messages, Math.max(0, messageIndex - 1))]);
-    }
-    data.currentBody = {
-        profile,
-        rawCard: card,
-        text: carrierCardText(card),
-        sections: carrierCardSections(card),
-        sourceMessageIndex: messageIndex,
-        sourceCardFingerprint: stableTextFingerprint(card),
-        sourceType,
-        startMessageIndex: mode === 'confirm' ? messageIndex : (previous?.startMessageIndex ?? messageIndex),
-        generation,
-        confirmed: mode === 'confirm' || previous?.confirmed === true,
-        importedAt: new Date().toISOString(),
-    };
-    saveChatMetadata();
-    updateCurrentBodyPrompt();
-    return data.currentBody;
 }
 
 function backupLedger(data, reason) {
@@ -177,7 +165,7 @@ function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
 
 function reconcileConversation({ force = false, reason = '自动对账' } = {}) {
     const data = chatData();
-    const messages = context()?.chat || [];
+    const messages = protocolMessages();
     const truth = conversationLedgerTruth(messages, force ? [] : data.suppressedRecordKeys);
     const records = truth.records;
     const record = truth.currentRecord;
@@ -185,14 +173,6 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
     let nextLives = truth.lives;
     let nextBody = record ? bodyFromConfirmedRecord(record, messages, nextLives, previous) : null;
 
-    if (!force && previous?.sourceType === 'manual') {
-        const matching = availableCarrierCards().find(item => stableTextFingerprint(item.card) === previous.sourceCardFingerprint);
-        const manualIsNewest = matching && (!record || matching.messageIndex >= record.cardIndex);
-        if (manualIsNewest) {
-            nextBody = { ...previous, sourceMessageIndex: matching.messageIndex };
-            nextLives = mergeLifeRecords(data.lives, truth.lives, inferredLivesFromCarrierCard(matching.card));
-        }
-    }
 
     const previousKey = previous?.sourceRecordKey || previous?.sourceCardFingerprint
         || (previous?.rawCard ? stableTextFingerprint(previous.rawCard) : '');
@@ -218,7 +198,10 @@ function dynamicContextText(statData, fullCarrier = false) {
 
 function buildCurrentBodyPrompt(body, statData, mode) {
     if (!body || mode === 'off') return { prompt: '', effectiveMode: body ? '已关闭' : '等待当前身体' };
-    const messages = context()?.chat || [];
+    const special=specialGeneration(protocolMessages(),statData);
+    if (special) return {prompt:'',effectiveMode:`暂停注入·${special}`};
+    if (body.profile?.姓名 && statData?.主角?.载体档案?.姓名 !== body.profile.姓名) return {prompt:'',effectiveMode:'等待MVU当前身体同步'};
+    const messages = protocolMessages();
     const profile = JSON.stringify(body.profile || {}, null, 2);
     const behavior = JSON.stringify(currentBehaviorProfile(body.rawCard || body.text, statData), null, 2);
     const firstSmartTurn = mode === 'smart' && smartInjectionUsesFullCard(body, messages);
@@ -290,8 +273,7 @@ function downloadJson(filename, payload) {
 async function verifyWorldBook(name, title, content) {
     const ctx = context();
     if (typeof fetch !== 'function' || typeof ctx?.getRequestHeaders !== 'function') {
-        const cached = await ctx?.loadWorldInfo?.(name);
-        return Object.values(normalizeEntries(cached)).some(entry => entry?.comment === `${ARCHIVE_PREFIX}${title}` && String(entry.content || '').trim() === content.trim());
+        throw new Error('后端世界书回读接口不可用；不以缓存代替写入验证，保留草稿');
     }
     const response = await fetch('/api/worldinfo/get', {
         method: 'POST',
@@ -301,46 +283,52 @@ async function verifyWorldBook(name, title, content) {
     });
     if (!response.ok) return false;
     const saved = await response.json();
-    return Object.values(normalizeEntries(saved)).some(entry => entry?.comment === `${ARCHIVE_PREFIX}${title}` && String(entry.content || '').trim() === content.trim());
+    return Object.values(normalizeEntries(saved)).some(entry => (entry?.comment === `${ARCHIVE_PREFIX}${title}` || entry?.comment === title) && String(entry.content || '').trim() === content.trim());
 }
 
 async function archivePendingLife() {
-    const ctx = context();
-    const { statData } = readEffectiveStatData();
-    const state = getPath(statData, '主角.换身状态', {});
-    const content = String(state?.待归档人生词条 || '').trim();
-    if (!content || state?.归档写入状态 !== '待写入世界书') {
-        notify('warning', '没有处于“待写入世界书”状态的人生词条');
-        return;
-    }
-    const name = currentWorldBookName();
-    if (!name) {
-        notify('error', '没有找到要写入的世界书；请在“设置与备份”中选择已有世界书');
-        return;
-    }
-    const title = archiveTitle(content, statData);
-    if (!globalThis.confirm(`即将把“${title}”写入现有世界书“${name}”。不会覆盖同名异文。继续吗？`)) return;
-    const book = await ctx.loadWorldInfo?.(name);
-    if (!book) throw new Error(`无法读取世界书：${name}`);
-    const result = upsertArchive(book, { title, content, keywords: archiveKeywords(title, content, statData) });
-    if (result.status === 'conflict') {
-        notify('error', `发现同名但内容不同的词条“${title}”，已停止写入，请先人工核对`);
-        return;
-    }
-    if (result.status === 'created') {
-        const data = chatData();
-        data.backups ??= [];
-        data.backups.push({ at: new Date().toISOString(), worldBookName: name, title, statData });
-        data.backups = data.backups.slice(-5);
-        saveChatMetadata();
-        await ctx.saveWorldInfo?.(name, result.book, true);
-        const verified = await verifyWorldBook(name, title, content);
-        if (!verified) throw new Error('世界书保存后回读校验失败；临时草稿已保留');
-    }
-    await writeMessagePath('stat_data.主角.换身状态.归档写入状态', '已写入世界书');
-    await writeMessagePath('stat_data.主角.换身状态.待归档人生词条', '');
-    notify('success', result.status === 'duplicate' ? '相同词条已经存在；已去重并完成状态清理' : `“${title}”已写入并回读验证成功`);
-    render();
+    if (archiveInFlight) return notify('warning','正在归档，请等待当前操作完成');
+    archiveInFlight=true;
+    try {
+        const ctx=context(), chatId=String(ctx?.chatId || ctx?.groupId || '');
+        const messageIndex=latestMessageIndex(), anchor=ctx?.chat?.[messageIndex];
+        const anchorText=String(anchor?.mes || '');
+        const statData=mvu.readStatDataAt(messageIndex);
+        const pending=archiveGate(statData);
+        if (!pending) throw new Error('当前消息MVU未证实有效待归档人生；先等待变量写回，草稿不会丢弃');
+        const records=confirmedCarrierRecords(protocolMessages());
+        if (!records.some(record => carrierGeneration(record.card,0) === pending.generation+1)) throw new Error('缺少可核实的死亡、候选、精确确认及提交链，已停止归档');
+        const {draft:content,title,generation}=pending;
+        const name=currentWorldBookName();
+        if (!name) throw new Error('请先选择本聊天已有的归档世界书');
+        const assertContext=() => {
+            const current=context();
+            if (String(current?.chatId || current?.groupId || '')!==chatId || latestMessageIndex()!==messageIndex || String(current?.chat?.[messageIndex]?.mes || '')!==anchorText) throw new Error('归档期间聊天或楼层改变，停止清理草稿');
+            const now=archiveGate(mvu.readStatDataAt(messageIndex));
+            if (!now || now.draft!==content || now.generation!==generation) throw new Error('归档期间草稿改变，停止清理');
+        };
+        if (!globalThis.confirm(`将“${title}”写入已有世界书“${name}”？同名异文或同世异人将停止。`)) return;
+        assertContext();
+        const book=await ctx.loadWorldInfo?.(name);
+        assertContext();
+        if (!book) throw new Error('无法读取归档世界书');
+        const result=upsertArchive(book,{title,content,keywords:archiveKeywords(title,content,statData)});
+        if (result.status==='conflict') throw new Error('同名异文或同一世代已有其它人生，停止写入；请核对');
+        if (result.status==='created') {
+            if (typeof ctx.saveWorldInfo!=='function') throw new Error('世界书保存接口不可用');
+            const data=chatData();data.backups??=[];
+            data.backups.push({at:new Date().toISOString(),worldBookName:name,title,statData});data.backups=data.backups.slice(-5);saveChatMetadata();
+            await ctx.saveWorldInfo(name,result.book,true);
+        }
+        assertContext();
+        if (!await verifyWorldBook(name,title,content)) throw new Error('后端回读未验证成功，保留草稿');
+        assertContext();
+        await mvu.completeArchive({messageIndex,chatId,draft:content,generation,assertContext});
+        const saved=mvu.readStatDataAt(messageIndex)?.主角?.换身状态;
+        if (saved?.待归档人生词条!=='' || saved?.归档写入状态!=='已写入世界书') throw new Error('世界书已保存，但MVU清理未确认，请刷新核对后重试；不会新增重复词条');
+        notify('success',result.status==='duplicate'?'相同词条已存在并回读核验；已清理对应草稿':`“${title}”已写入并回读核验`);
+        await render();
+    } finally { archiveInFlight=false; }
 }
 
 async function exportBackup() {
@@ -358,6 +346,7 @@ async function exportBackup() {
     downloadJson(`历代人生备份-${Date.now()}.json`, {
         format: 'sillytavern-legacy-life-backup', version: 1, exportedAt: new Date().toISOString(),
         chatId: ctx?.chatId || ctx?.groupId || '', statData, worldBookName: name,
+        pluginLedger: structuredClone(chatData(false)),
         archiveEntries: book ? Object.values(normalizeEntries(book)).filter(entry => String(entry?.comment || '').startsWith(ARCHIVE_PREFIX)) : [],
         transcript,
     });
@@ -401,7 +390,7 @@ function pretty(value) {
 
 function availableCarrierCards() {
     const result = [];
-    for (const [messageIndex, message] of (context()?.chat || []).entries()) {
+    for (const [messageIndex, message] of (protocolMessages()).entries()) {
         if (!message || message.is_user || message.is_system) continue;
         const cards = extractCarrierCards(message.mes);
         for (const [cardIndex, card] of cards.entries()) {
@@ -413,12 +402,13 @@ function availableCarrierCards() {
 }
 
 function importSelectedCard(record, mode) {
-    if (!record) return notify('warning', '没有选择可导入的人物卡');
-    const verb = mode === 'confirm' ? '确认换身并导入' : '同步为当前身体';
-    if (!globalThis.confirm(`${verb}“${record.profile.姓名}”？\n\n人物卡完整原文会保存到当前聊天；${mode === 'confirm' ? '旧身体会进入历代人生。' : '不会新增历代人生。'}`)) return;
-    saveImportedBody(record.card, record.profile, record.messageIndex, mode);
-    notify('success', `已${verb}：${record.profile.姓名}`);
-    render();
+    if (!record) return notify('warning','没有选择人物卡');
+    const messages=protocolMessages();
+    const valid=confirmedCarrierRecords(messages).find(item => item.cardIndex===record.messageIndex && stableTextFingerprint(item.card)===stableTextFingerprint(record.card));
+    if (!valid) return notify('warning','这仍是候选或提交链不完整。请在有效死亡和待确认状态下亲自发送精确口令“确认换身”，等待MVU提交后再同步。按钮不会替你确认。');
+    reconcileConversation({force:true,reason:'同步已确认档案'});
+    updateCurrentBodyPrompt();render();
+    notify('success','已按有效确认链重新同步；未发出口令、未增加世代');
 }
 
 async function rebuildFromCurrentChat() {
@@ -433,7 +423,7 @@ async function rebuildFromCurrentChat() {
 async function clearCurrentChatLedger() {
     if (!globalThis.confirm('清空本聊天由插件保存的当前身体、历代人生和 AI 注入？\n\n现有确认楼层会暂时忽略；以后新产生的确认记录仍可自动识别。世界书内容不会被删除。')) return;
     const data = chatData();
-    const messages = context()?.chat || [];
+    const messages = protocolMessages();
     backupLedger(data, '手动清空本聊天插件记录');
     data.suppressedRecordKeys = confirmedCarrierRecords(messages).map(record => carrierRecordKey(record, messages));
     data.currentBody = null;
@@ -516,7 +506,7 @@ function el(tag, className, text) {
 }
 
 function renderCurrent(panel, statData, runtimeInfo = {}) {
-    const messages = context()?.chat || [];
+    const messages = protocolMessages();
     const importedBody = currentImportedBody();
     const confirmedProfile = confirmedCarrierProfile(messages);
     const importedProfile = asObject(importedBody?.profile);
@@ -585,7 +575,7 @@ async function renderLives(panel, statData) {
     const name = currentWorldBookName();
     const book = name ? await context()?.loadWorldInfo?.(name) : null;
     const entries = book ? Object.values(normalizeEntries(book)) : [];
-    const summaries = lifeHistorySummaries(context()?.chat || [], statData, entries, chatData(false)?.lives || []);
+    const summaries = lifeHistorySummaries(protocolMessages(), statData, entries, chatData(false)?.lives || []);
     const search = document.createElement('input');
     search.className = 'text_pole';
     search.placeholder = '搜索姓名或经历';
@@ -679,7 +669,7 @@ function renderSettings(panel) {
     const importActions = el('div', 'llm-actions');
     importActions.append(
         createButton('同步为当前身体', () => importSelectedCard(cards[Number(cardSelect.value)], 'sync')),
-        createButton('确认换身并导入', () => importSelectedCard(cards[Number(cardSelect.value)], 'confirm'), 'menu_button llm-primary'),
+        createButton('同步已确认换身', () => importSelectedCard(cards[Number(cardSelect.value)], 'confirm'), 'menu_button llm-primary'),
     );
     const ledgerActions = el('div', 'llm-actions');
     ledgerActions.append(
@@ -757,7 +747,7 @@ async function render() {
     const runtimeInfo = readEffectiveStatData();
     const statData = runtimeInfo.statData;
     if (!Object.keys(asObject(statData)).length) {
-        panel.append(el('div', 'llm-warning', '没有检测到 stat_data；身份与历代人生仍会尝试从已确认的正文人物卡读取。'));
+        panel.append(el('div', 'llm-warning', '没有检测到 stat_data；无法核实换身提交，暂停候选接管与归档。旧账本迁移备份随导出保留。'));
     }
     if (sync) {
         const hasBody = Boolean(currentImportedBody());
@@ -765,6 +755,7 @@ async function render() {
         sync.dataset.state = hasBody ? 'synced' : 'empty';
         sync.title = runtimeInfo.appliedOperations ? `已从最新正文补全 ${runtimeInfo.appliedOperations} 项动态变化` : '';
     }
+    if (!currentImportedBody() && chatData(false)?.legacyMigrationBackup?.data?.currentBody) panel.append(el('div','llm-warning','旧载体缺少完整提交证据，已保留迁移备份并暂停自动注入；导出备份包含旧账本，真实MVU与世界书未被重置。'));
     capturePendingSnapshot(statData);
     if (tab === 'current') renderCurrent(panel, statData, runtimeInfo);
     if (tab === 'lives') await renderLives(panel, statData);
@@ -783,8 +774,8 @@ function installCardButtons() {
         if (!profile.姓名) continue;
         const actions = el('div', 'llm-actions llm-card-actions');
         actions.append(
-            createButton('导入为当前身体', () => importSelectedCard({ messageIndex, card, profile }, 'sync')),
-            createButton('确认换身并导入', () => importSelectedCard({ messageIndex, card, profile }, 'confirm'), 'menu_button llm-primary'),
+            createButton('同步已确认档案', () => importSelectedCard({ messageIndex, card, profile }, 'sync')),
+            createButton('同步已确认换身', () => importSelectedCard({ messageIndex, card, profile }, 'confirm'), 'menu_button llm-primary'),
         );
         (message.querySelector('.mes_text') || message.querySelector('.mes_block') || message).append(actions);
     }
@@ -828,7 +819,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.5.0 已加载');
+    console.log('[历代人生管理器] v0.5.1 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

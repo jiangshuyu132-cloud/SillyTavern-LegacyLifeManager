@@ -1,3 +1,4 @@
+import { protocolTimeline, confirmationGate, commitGate, isDiscussion } from './strict-protocol.js';
 export const ARCHIVE_PREFIX = '[历代记忆档案]';
 
 export function clone(value) {
@@ -167,7 +168,7 @@ export function smartInjectionUsesFullCard(body, messages = []) {
 
 export function compactLifeIndex(lives = [], maxChars = 1200) {
     const limit = Math.max(160, Number(maxChars) || 1200);
-    const records = mergeLifeRecords(lives);
+    const records = mergeLifeRecords(lives).filter(item => !item.conflict);
     const lines = [];
     let used = 0;
     let omitted = 0;
@@ -385,7 +386,7 @@ export function carrierCardText(card) {
 
 const BEHAVIOR_PROFILE_FIELDS = [
     ['性格与价值观', ['当前原主性格与价值观', '性格与价值观', '人格与价值观']],
-    ['思维方式与认知边界', ['思维方式', '原主完整记忆与认知边界', '原主记忆与认知', '认知边界']],
+    ['思维方式与认知边界', ['思维方式与认知边界', '思维方式', '原主完整记忆与认知边界', '原主记忆与认知', '认知边界']],
     ['情绪模式与当前感情', ['情绪模式', '当前感情', '当前重要感情']],
     ['喜爱与厌恶', ['喜爱与厌恶', '喜好与厌恶', '喜恶']],
     ['愿望与恐惧', ['愿望与恐惧']],
@@ -419,6 +420,7 @@ export function currentBehaviorProfile(card, statData = {}) {
         }
         if (value) result[target] = value;
     }
+    if (statData?.主角?.技能 && typeof statData.主角.技能 === 'object') result.当前技能与身体经验 = structuredClone(statData.主角.技能);
     return result;
 }
 
@@ -441,8 +443,7 @@ export function carrierCardSections(card) {
 
 export function isCarrierConfirmation(value) {
     const text = String(value || '').trim();
-    if (text === '确认换身') return true;
-    return /^发送\s*["“']确认换身["”']\s*[，,、。:]\s*正式接管[^\n]{0,160}$/u.test(text);
+    return text === '确认换身';
 }
 
 export function extractCarrierCards(text) {
@@ -480,7 +481,7 @@ export function parseCarrierCard(card) {
     };
 }
 
-export function confirmedCarrierRecords(messages = []) {
+export function unvalidatedCarrierRecords(messages = []) {
     const records = [];
     for (let index = 0; index < messages.length; index += 1) {
         const confirmation = messages[index];
@@ -498,6 +499,29 @@ export function confirmedCarrierRecords(messages = []) {
         }
     }
     return records;
+}
+
+export function confirmedCarrierRecords(messages = []) {
+    const timeline = protocolTimeline(messages, {storedOnly:true});
+    const accepted = [], consumed = new Set();
+    for (const item of unvalidatedCarrierRecords(messages)) {
+        if (isDiscussion(messages[item.cardIndex]) || isDiscussion(messages[item.confirmationIndex])) continue;
+        const before = timeline[item.confirmationIndex - 1] || {};
+        if (!confirmationGate(before, messages[item.confirmationIndex]?.mes, item.card)) continue;
+        const generation = carrierGeneration(item.card, 0);
+        if (!generation || consumed.has(generation)) continue;
+        let committed = false;
+        for (let i=item.confirmationIndex+1; i<messages.length; i++) {
+            if (messages[i]?.is_user && !messages[i].is_system) break;
+            if (messages[i]?.is_system || isDiscussion(messages[i])) continue;
+            if (commitGate(before,timeline[i],item.profile,generation)) {
+                accepted.push({...item, commitIndex:i}); consumed.add(generation); committed=true; break;
+            }
+        }
+        // A bare confirmation message or an incomplete/failed MVU update is not a commit.
+        if (!committed) continue;
+    }
+    return accepted;
 }
 
 export function stableTextFingerprint(value) {
@@ -522,7 +546,7 @@ export function carrierRecordKey(record, messages = []) {
 
 export function carrierGeneration(card, fallback = 1) {
     const text = carrierCardText(card);
-    const arabic = text.match(/世代(?:编号)?[：:]\s*第?\s*(\d+)\s*世/);
+    const arabic = text.match(/世代(?:编号)?[：:]\s*第?\s*(\d+)\s*(?:世|$)/m);
     if (arabic) return Number(arabic[1]);
     const chinese = text.match(/世代(?:编号)?[：:]\s*第?\s*([一二三四五六七八九十]+)\s*世/);
     const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
@@ -534,7 +558,7 @@ export function responseSummaries(messages = [], startIndex = 0, endIndex = mess
     const seen = new Set();
     for (let index = Math.max(0, startIndex); index <= Math.min(endIndex, messages.length - 1); index += 1) {
         const message = messages[index];
-        if (!message || message.is_user || message.is_system) continue;
+        if (!message || message.is_user || message.is_system || isDiscussion(message)) continue;
         for (const match of String(message.mes || '').matchAll(/<summary\b[^>]*>([\s\S]*?)<\/summary>/gi)) {
             const text = carrierCardText(match[1]).replace(/\s+/g, ' ').trim();
             if (!text || seen.has(text)) continue;
@@ -587,6 +611,11 @@ export function mergeLifeRecords(...collections) {
                 summary: String(item.summary || '').trim(),
             };
             const previous = byGeneration.get(generation);
+            if (previous && previous.name !== normalized.name) {
+                byGeneration.set(generation, { ...previous, conflict: true, summary: '【同世身份冲突，暂停记忆调用；请核对原始资料】', conflictingNames: [...new Set([...(previous.conflictingNames || [previous.name]), normalized.name])] });
+                continue;
+            }
+            if (previous?.conflict) continue;
             if (!previous || normalized.summary.length >= String(previous.summary || '').length) {
                 byGeneration.set(generation, normalized);
             }
@@ -769,7 +798,10 @@ export function lifeHistorySummaries(messages = [], statData = {}, archiveEntrie
         if (!item) return;
         const key = Number.isFinite(item.generation) ? `generation:${item.generation}` : item.title;
         const previous = collected.get(key);
-        if (!previous || String(item.summary || '').length >= String(previous.summary || '').length) collected.set(key, item);
+        if (previous?.conflict) return;
+        if (previous && previous.name && item.name && previous.name !== item.name) {
+            collected.set(key,{...previous,conflict:true,summary:`同一世代姓名冲突：${previous.name} / ${item.name}；请核对，不能作为事实注入。`});
+        } else if (!previous || String(item.summary || '').length >= String(previous.summary || '').length) collected.set(key, item);
     };
     const index = Array.isArray(statData?.历代记忆摘要) ? statData.历代记忆摘要 : [];
     index.map(summaryFromIndex).forEach(put);
@@ -877,6 +909,11 @@ export function makeArchiveEntry(uid, title, content, keywords) {
 export function upsertArchive(book, { title, content, keywords }) {
     const next = clone(book || {});
     next.entries = normalizeEntries(next);
+    const expectedGeneration = title.match(/^第(\d+)世/)?.[1];
+    if (expectedGeneration && Object.values(next.entries).some(entry => {
+        const name=String(entry?.comment || '').replace(ARCHIVE_PREFIX,'').trim();
+        return name.match(/^第(\d+)世/)?.[1]===expectedGeneration && name!==title;
+    })) return {status:'conflict',book:next,uid:null};
     const expectedComment = `${ARCHIVE_PREFIX}${title}`;
     const existing = Object.values(next.entries).find(entry => entry?.comment === expectedComment || entry?.comment === title);
     if (existing) {
@@ -885,8 +922,14 @@ export function upsertArchive(book, { title, content, keywords }) {
         }
         return { status: 'conflict', book: next, uid: existing.uid };
     }
+    const generation = title.match(/^第(\d+)世/)?.[1];
+    if (generation && Object.values(next.entries).some(entry => {
+        const name = String(entry?.comment || '').replace(ARCHIVE_PREFIX, '').trim();
+        return name.match(/^第(\d+)世/)?.[1] === generation;
+    })) return { status: 'conflict', book: next, uid: null };
     let uid = 0;
-    while (Object.hasOwn(next.entries, uid)) uid += 1;
+    const usedUids = new Set(Object.values(next.entries).map(entry => Number(entry?.uid)));
+    while (Object.hasOwn(next.entries, uid) || usedUids.has(uid)) uid += 1;
     next.entries[uid] = makeArchiveEntry(uid, title, content, keywords);
     return { status: 'created', book: next, uid };
 }
