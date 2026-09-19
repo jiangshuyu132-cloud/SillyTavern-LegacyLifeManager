@@ -145,6 +145,11 @@ test('current behavior profile keeps all decision-lens fields and prefers live d
     assert.equal(result.思维方式与认知边界, '先确认退路，再处理眼前问题。');
     assert.match(result.愿望与恐惧, /再次被抛下/);
     assert.match(result.当前技能与身体经验, /战斗经验很少/);
+    const strict = currentBehaviorProfile(card, {
+        主角: { 载体档案: { 性格与价值观: '变量里的简略谨慎。' } },
+    }, { preferCard: true });
+    assert.match(strict.性格与价值观, /被逼到底线/);
+    assert.doesNotMatch(strict.性格与价值观, /变量里的简略/);
 });
 
 test('normalizeStage accepts only protocol stages', () => {

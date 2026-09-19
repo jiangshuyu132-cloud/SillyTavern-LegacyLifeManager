@@ -49,5 +49,13 @@ test('旧插件账本首次升级永久备份，不覆写MVU与世界书',()=>{
  setup();ctx.chat=[];ctx.chatMetadata.legacy_life_manager={version:5,currentBody:{profile:{姓名:'未核实旧人物'}},lives:[{generation:1,name:'旧人'}],backups:[]};plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;assert.equal(data.currentBody,null);assert.equal(data.legacyMigrationBackup.data.currentBody.profile.姓名,'未核实旧人物');assert.equal(data.legacyMigrationBackup.data.lives[0].name,'旧人');assert.equal(saveCount,0);
 });
 test('确认首轮只注入金钱保护，普通下一轮恢复完整当前身体档案',()=>{
- const after=setup();const body={profile:{姓名:'新身体'},rawCard:card,text:card};assert.match(plugin.buildCurrentBodyPrompt(body,after,'compact').prompt,/<legacy_life_money_continuity>/);ctx.chat.push({is_user:true,mes:'观察门口'});assert.match(plugin.buildCurrentBodyPrompt(body,after,'compact').prompt,/<legacy_life_current_body>/);
+ const after=setup();const body={profile:{姓名:'新身体'},rawCard:card,text:card};assert.match(plugin.buildCurrentBodyPrompt(body,after,'compact').prompt,/<legacy_life_money_continuity>/);ctx.chat.push({is_user:true,mes:'观察门口'});assert.match(plugin.buildCurrentBodyPrompt(body,after,'compact').prompt,/<legacy_life_current_body\b/);
+});
+test('严格主档案每轮发送完整人物卡并保留正文变量模块',()=>{
+ const after=setup();ctx.chat.push({is_user:true,mes:'观察门口'});const body={profile:{姓名:'新身体'},rawCard:card,text:card};const prompt=plugin.buildCurrentBodyPrompt(body,after,'strict');
+ assert.equal(prompt.effectiveMode,'严格主档案·每轮完整');
+ assert.match(prompt.prompt,/confirmed-plugin-dossier-first/);
+ assert.match(prompt.prompt,/必须同时读取本插件档案与正文已有的 <status_current_variables>\/stat_data/);
+ assert.match(prompt.prompt,/物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场/);
+ assert.match(prompt.prompt,/【当前载体人物设定开始】/);
 });

@@ -445,30 +445,35 @@ const BEHAVIOR_PROFILE_FIELDS = [
 
 /**
  * Keeps the current carrier's decision lens available without resending the
- * entire visual card. Live MVU values override the confirmation-time card so
- * genuine character development can take effect on the next generation.
+ * entire visual card. Strict mode can prefer the confirmed detailed card;
+ * other modes preserve the older live-development-first merge.
  */
-export function currentBehaviorProfile(card, statData = {}) {
+export function currentBehaviorProfile(card, statData = {}, options = {}) {
     const carrier = asObject(statData?.主角?.载体档案);
+    const preferCard = options?.preferCard === true;
     const result = {};
     for (const [target, labels] of BEHAVIOR_PROFILE_FIELDS) {
         let value = '';
-        for (const label of labels) {
-            const liveValue = carrier[label];
-            if (liveValue != null && liveValue !== '') {
-                value = typeof liveValue === 'string' ? liveValue.trim() : liveValue;
-                break;
-            }
-        }
-        if (!value) {
+        const readCard = () => {
             for (const label of labels) {
                 value = carrierField(card, label);
                 if (value) break;
             }
-        }
+        };
+        const readLive = () => {
+            for (const label of labels) {
+                const liveValue = carrier[label];
+                if (liveValue != null && liveValue !== '') {
+                    value = typeof liveValue === 'string' ? liveValue.trim() : liveValue;
+                    break;
+                }
+            }
+        };
+        if (preferCard) readCard(); else readLive();
+        if (!value) { if (preferCard) readLive(); else readCard(); }
         if (value) result[target] = value;
     }
-    if (statData?.主角?.技能 && typeof statData.主角.技能 === 'object') result.当前技能与身体经验 = structuredClone(statData.主角.技能);
+    if (!preferCard && statData?.主角?.技能 && typeof statData.主角.技能 === 'object') result.当前技能与身体经验 = structuredClone(statData.主角.技能);
     return result;
 }
 
