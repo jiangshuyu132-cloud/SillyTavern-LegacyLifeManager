@@ -352,6 +352,38 @@ test('partial JSONPatch is extractable history text but cannot prove an MVU comm
     assert.deepEqual(truth.lives, []);
 });
 
+test('recovers a confirmed carrier when an old MVU schema strips only protocol fields', () => {
+    const card = `【当前载体人物设定开始】
+<div><b>世代编号：</b>第2世<br><b>姓名：</b>芙莉莲<br><b>种族：</b>高等精灵<br><b>职业：</b>法师<br><b>当前地点：</b>彩玉区出租屋<br><b>历代经历记忆：</b><br>第1世·旧身：在暗巷中死亡。</div>
+【当前载体人物设定结束】`;
+    const candidatePatch = `<UpdateVariable><JSONPatch>${JSON.stringify([
+        { op: 'replace', path: '/主角/换身状态', value: { 阶段: '等待确认', 当前世代编号: 1, 当前身体死亡已确认: true, 当前身体死亡信息: '已死亡', 待确认人物卡: '【候选】芙莉莲，高等精灵女性，法师。详细设定见正文候选卡。', 待归档人生词条: '', 归档写入状态: '无待处理' } },
+    ])}</JSONPatch></UpdateVariable>`;
+    const commitPatch = `<UpdateVariable><JSONPatch>${JSON.stringify([
+        { op: 'replace', path: '/主角/换身状态', value: { 阶段: '当前身体生效', 当前世代编号: 2, 当前身体死亡已确认: false, 当前身体死亡信息: '', 待确认人物卡: '', 待归档人生词条: '词条名称: 第1世·旧身\n经历', 归档写入状态: '待写入世界书' } },
+        { op: 'replace', path: '/主角/载体档案', value: { 姓名: '芙莉莲', 种族: '高等精灵', 职业: '法师', 地点: '彩玉区出租屋' } },
+        { op: 'insert', path: '/历代记忆摘要/-', value: { 世代编号: 1, 身体姓名: '旧身', 详细词条名称: '第1世·旧身' } },
+    ])}</JSONPatch></UpdateVariable>`;
+    const deadStored = { 主角: { 种族: '人类', 职业: [], 生命值: { 当前: 0 } }, 世界: { 地点: '暗巷' } };
+    const liveStored = { 主角: { 种族: '高等精灵', 职业: ['法师'], 生命值: { 当前: 535 } }, 世界: { 地点: '彩玉区出租屋' } };
+    const records = confirmedCarrierRecords([
+        { is_user: false, mes: `${card}${candidatePatch}`, stat_data: deadStored },
+        { is_user: true, mes: '确认换身', stat_data: deadStored },
+        { is_user: false, mes: commitPatch, stat_data: liveStored },
+    ]);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].profile.姓名, '芙莉莲');
+});
+
+test('schema recovery still rejects text-only claims without a stored death-to-life transition', () => {
+    const noStoredEvidence = [
+        { is_user: false, mes: carrierCard },
+        { is_user: true, mes: '确认换身' },
+        { is_user: false, mes: '<UpdateVariable><JSONPatch>[]</JSONPatch></UpdateVariable>' },
+    ];
+    assert.equal(confirmedCarrierRecords(noStoredEvidence).length, 0);
+});
+
 test('narrative death and confirmation without real state cannot fabricate a commit', () => {
     const noHistoryCard = actualCarrierCardVariant.replace(/<b>===== 历代经历记忆 =====<\/b>[\s\S]*?<b>===== 不继承声明 =====<\/b>/, '<b>===== 不继承声明 =====</b>');
     const lives = rebuildConversationLives([

@@ -1,6 +1,12 @@
 // Migration compatibility only. Pure helpers; never writes chat or MVU data.
 const record = value => value && typeof value === 'object' && !Array.isArray(value) ? value : null;
 const copy = value => structuredClone(value);
+const RECOVERABLE_PROTOCOL_PATHS = [
+    ['主角', '换身状态'],
+    ['主角', '载体档案'],
+    ['主角', '本世经历草稿'],
+    ['历代记忆摘要'],
+];
 export function isDiscussion(message) {
     return /<(?:discussion_record|destined_discussion)\b/.test(String(message?.mes || ''));
 }
@@ -24,6 +30,42 @@ function parts(path) {
     if (!['主角', '历代记忆摘要', '世界'].includes(result[0])) return null;
     if (result.some(x => ['__proto__', 'constructor', 'prototype'].includes(x))) return null;
     return result;
+}
+function hasPath(root, keys) {
+    let value = root;
+    for (const key of keys) {
+        if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return false;
+        value = value[key];
+    }
+    return true;
+}
+function readPath(root, keys) {
+    let value = root;
+    for (const key of keys) value = value?.[key];
+    return value;
+}
+function writePath(root, keys, value) {
+    let parent = root;
+    for (let index = 0; index < keys.length - 1; index += 1) {
+        parent[keys[index]] ??= {};
+        parent = parent[keys[index]];
+    }
+    parent[keys.at(-1)] = copy(value);
+}
+function recoverablePath(path) {
+    const keys = parts(path);
+    return keys && RECOVERABLE_PROTOCOL_PATHS.some(prefix => prefix.every((key, index) => keys[index] === key));
+}
+function patchOperations(message) {
+    const raw = String(message?.mes || '').replace(/```[\s\S]*?```/g, '');
+    const operations = [];
+    for (const match of raw.matchAll(/<UpdateVariable\b[^>]*>[\s\S]*?<JSONPatch\b[^>]*>\s*([\s\S]*?)\s*<\/JSONPatch>[\s\S]*?<\/UpdateVariable>/gi)) {
+        try {
+            const parsed = JSON.parse(match[1]);
+            if (Array.isArray(parsed)) operations.push(...parsed);
+        } catch { /* incomplete generation is not a commit */ }
+    }
+    return operations;
 }
 function locate(root, path, create) {
     const keys = parts(path);
@@ -66,24 +108,65 @@ export function applyProtocolPatch(root, operation) {
     else parent[key] = copy(operation.value);
 }
 // A stored snapshot is already the result for that floor: do not replay its deltas.
-export function protocolTimeline(messages = [], {storedOnly = false} = {}) {
+export function protocolTimeline(messages = [], {storedOnly = false, recoverMissingProtocol = false} = {}) {
     let state = {};
     return messages.map(message => {
         if (message && !message.is_system && !isDiscussion(message)) {
             const stored = messageStat(message);
-            if (stored) state = copy(stored);
-            else if (!message.is_user && !storedOnly) {
-                const raw = String(message.mes || '').replace(/```[\s\S]*?```/g, '');
-                for (const match of raw.matchAll(/<UpdateVariable\b[^>]*>[\s\S]*?<JSONPatch\b[^>]*>\s*([\s\S]*?)\s*<\/JSONPatch>[\s\S]*?<\/UpdateVariable>/gi)) {
-                    try {
-                        const operations = JSON.parse(match[1]);
-                        if (Array.isArray(operations)) for (const op of operations) applyProtocolPatch(state, op);
-                    } catch { /* incomplete generation is not a commit */ }
+            const previous = state;
+            if (stored) {
+                state = copy(stored);
+                if (recoverMissingProtocol) {
+                    for (const path of RECOVERABLE_PROTOCOL_PATHS) {
+                        if (!hasPath(state, path) && hasPath(previous, path)) writePath(state, path, readPath(previous, path));
+                    }
+                }
+            }
+            if (!message.is_user && !storedOnly) {
+                for (const operation of patchOperations(message)) {
+                    if (!stored || (recoverMissingProtocol && recoverablePath(operation?.path))) applyProtocolPatch(state, operation);
                 }
             }
         }
         return copy(state);
     });
+}
+
+function numberAt(stat, path) {
+    const value = readPath(stat, path);
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+function comparable(value) {
+    if (Array.isArray(value)) return value.map(comparable).filter(Boolean).join('、');
+    return String(value ?? '').replace(/\s+/g, '').trim();
+}
+function looselyMatches(left, right) {
+    const a = comparable(left), b = comparable(right);
+    return Boolean(a && b && (a === b || a.includes(b) || b.includes(a)));
+}
+
+/**
+ * Recovery evidence for chats whose MVU schema silently strips extension-only
+ * fields. Text output alone is never enough: the persisted standard MVU
+ * snapshot must also prove a dead body became a live body matching the card.
+ */
+export function schemaStrippedCommitEvidence(messages, cardIndex, commitIndex, profile = {}) {
+    let before = null;
+    for (let index = cardIndex; index >= 0; index -= 1) {
+        before = messageStat(messages[index]);
+        if (before) break;
+    }
+    const after = messageStat(messages[commitIndex]);
+    if (!before || !after) return false;
+    const beforeHp = numberAt(before, ['主角', '生命值', '当前']);
+    const afterHp = numberAt(after, ['主角', '生命值', '当前']);
+    if (beforeHp == null || beforeHp > 0 || afterHp == null || afterHp <= 0) return false;
+    return [
+        [after?.主角?.种族, profile?.种族],
+        [after?.主角?.职业, profile?.职业],
+        [after?.世界?.地点, profile?.地点],
+    ].some(([stored, expected]) => looselyMatches(stored, expected));
 }
 export function confirmationGate(stat, input, card = '') {
     const s = stat?.主角?.换身状态;
@@ -94,6 +177,26 @@ export function confirmationGate(stat, input, card = '') {
     if (s.归档写入状态 === '待写入世界书' && String(s.待归档人生词条 || '').trim()) return false;
     if (card && !s.待确认人物卡.includes(card.trim())) return false;
     return true;
+}
+/**
+ * Recovery gate for MVU schemas that preserve protocol fields but shorten the
+ * pending character card. The caller must also require persisted death-to-life
+ * evidence before accepting the following assistant reply as a commit.
+ */
+export function schemaStrippedConfirmationGate(stat, input, profile = {}, generation = 0) {
+    const s = stat?.主角?.换身状态;
+    if (String(input || '').trim() !== '确认换身') return false;
+    if (s?.阶段 !== '等待确认' || s.当前身体死亡已确认 !== true) return false;
+    if (!Number.isInteger(s.当前世代编号) || s.当前世代编号 < 1) return false;
+    if (!Number.isInteger(generation) || generation !== s.当前世代编号 + 1) return false;
+    const pending = String(s.待确认人物卡 || '').trim();
+    if (!pending) return false;
+    if (s.归档写入状态 === '待写入世界书' && String(s.待归档人生词条 || '').trim()) return false;
+    const normalizedPending = comparable(pending);
+    const name = comparable(profile?.姓名);
+    if (!name || !normalizedPending.includes(name)) return false;
+    const species = comparable(profile?.种族);
+    return !species || normalizedPending.includes(species);
 }
 export function commitGate(before, after, profile, generation) {
     const a = before?.主角?.换身状态, b = after?.主角?.换身状态;

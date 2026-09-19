@@ -1,4 +1,11 @@
-import { protocolTimeline, confirmationGate, commitGate, isDiscussion } from './strict-protocol.js';
+import {
+    protocolTimeline,
+    confirmationGate,
+    commitGate,
+    isDiscussion,
+    schemaStrippedCommitEvidence,
+    schemaStrippedConfirmationGate,
+} from './strict-protocol.js';
 export const ARCHIVE_PREFIX = '[历代记忆档案]';
 
 export function clone(value) {
@@ -447,7 +454,10 @@ export function isCarrierConfirmation(value) {
 }
 
 export function extractCarrierCards(text) {
-    const source = String(text || '');
+    // The pending-card JSONPatch often serializes the complete card a second
+    // time. That escaped copy is protocol data, not another visible card, and
+    // selecting it breaks the confirmation fingerprint.
+    const source = String(text || '').replace(/<UpdateVariable\b[^>]*>[\s\S]*?<\/UpdateVariable>/gi, '');
     return [...source.matchAll(/【当前载体人物设定开始】([\s\S]*?)【当前载体人物设定结束】/g)]
         .map(match => match[1]?.trim())
         .filter(Boolean);
@@ -503,18 +513,27 @@ export function unvalidatedCarrierRecords(messages = []) {
 
 export function confirmedCarrierRecords(messages = []) {
     const timeline = protocolTimeline(messages, {storedOnly:true});
+    const recoveredTimeline = protocolTimeline(messages, {recoverMissingProtocol:true});
     const accepted = [], consumed = new Set();
     for (const item of unvalidatedCarrierRecords(messages)) {
         if (isDiscussion(messages[item.cardIndex]) || isDiscussion(messages[item.confirmationIndex])) continue;
-        const before = timeline[item.confirmationIndex - 1] || {};
-        if (!confirmationGate(before, messages[item.confirmationIndex]?.mes, item.card)) continue;
         const generation = carrierGeneration(item.card, 0);
         if (!generation || consumed.has(generation)) continue;
+        let before = timeline[item.confirmationIndex - 1] || {};
+        let recovery = false;
+        if (!confirmationGate(before, messages[item.confirmationIndex]?.mes, item.card)) {
+            before = recoveredTimeline[item.confirmationIndex - 1] || {};
+            recovery = confirmationGate(before, messages[item.confirmationIndex]?.mes, item.card)
+                || schemaStrippedConfirmationGate(before, messages[item.confirmationIndex]?.mes, item.profile, generation);
+            if (!recovery) continue;
+        }
         let committed = false;
         for (let i=item.confirmationIndex+1; i<messages.length; i++) {
             if (messages[i]?.is_user && !messages[i].is_system) break;
             if (messages[i]?.is_system || isDiscussion(messages[i])) continue;
-            if (commitGate(before,timeline[i],item.profile,generation)) {
+            const after = recovery ? recoveredTimeline[i] : timeline[i];
+            const storedEvidence = !recovery || schemaStrippedCommitEvidence(messages,item.cardIndex,i,item.profile);
+            if (storedEvidence && commitGate(before,after,item.profile,generation)) {
                 accepted.push({...item, commitIndex:i}); consumed.add(generation); committed=true; break;
             }
         }

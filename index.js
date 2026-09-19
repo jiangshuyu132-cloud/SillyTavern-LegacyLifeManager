@@ -40,6 +40,7 @@ const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 5, inje
 let initialized = false;
 let archiveInFlight = false;
 let refreshTimers = [];
+let lastNotification = { key: '', at: 0 };
 let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'smart', effectiveMode: '等待当前身体' };
 
 function context() {
@@ -86,6 +87,10 @@ function chatData(create = true) {
 }
 
 function notify(level, message) {
+    const key = `${level}:${message}`;
+    const now = Date.now();
+    if (lastNotification.key === key && now - lastNotification.at < 1500) return;
+    lastNotification = { key, at: now };
     if (globalThis.toastr?.[level]) globalThis.toastr[level](message, '历代人生管理器');
     else console[level === 'error' ? 'error' : 'log'](`[历代人生管理器] ${message}`);
 }
