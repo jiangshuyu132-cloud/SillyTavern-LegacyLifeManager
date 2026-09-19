@@ -13,6 +13,7 @@ import {
     confirmedCarrierProfile,
     confirmedCarrierRecords,
     conversationLedgerTruth,
+    crossLifeMoneyTransition,
     currentBehaviorProfile,
     currentBodySummary,
     detectCarryover,
@@ -22,6 +23,7 @@ import {
     lifeHistorySummaries,
     liveBodyState,
     mergeLifeRecords,
+    normalizedMoney,
     normalizeEntries,
     parseCarrierCard,
     rebuildConversationLives,
@@ -36,9 +38,10 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 5, injectionMode: 'smart' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 6, injectionMode: 'smart' });
 let initialized = false;
 let archiveInFlight = false;
+let moneyInheritanceInFlight = false;
 let refreshTimers = [];
 let lastNotification = { key: '', at: 0 };
 let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'smart', effectiveMode: '等待当前身体' };
@@ -59,6 +62,10 @@ function settings() {
         current.dataVersion = 5;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 6) {
+        current.dataVersion = 6;
+        ctx.saveSettingsDebounced?.();
+    }
     if (!['smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'smart';
     return current;
 }
@@ -67,7 +74,7 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 5, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 6, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {} };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
@@ -77,11 +84,13 @@ function chatData(create = true) {
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 5;
+        data.version = 6;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
         data.backups ??= [];
+        data.portraits ??= {};
+        data.moneyInheritance ??= {};
     }
     return data;
 }
@@ -197,6 +206,126 @@ function currentImportedBody() {
     return chatData(false)?.currentBody || null;
 }
 
+async function applyMoneyInheritance() {
+    if (moneyInheritanceInFlight) return false;
+    const data = chatData();
+    const messages = protocolMessages();
+    const record = conversationLedgerTruth(messages, data.suppressedRecordKeys).currentRecord;
+    if (!record) return false;
+    const key = carrierRecordKey(record, messages);
+    if (!key || data.moneyInheritance?.[key]?.status === 'applied') return false;
+    const transition = crossLifeMoneyTransition(messages, record);
+    if (!transition) return false;
+
+    moneyInheritanceInFlight = true;
+    try {
+        if (transition.needsRestore) {
+            await mvu.writeMessagePath('stat_data.主角.金钱', transition.adjustedMoney);
+            const verified = normalizedMoney(mvu.readStatData()?.主角?.金钱);
+            if (!Object.is(verified, transition.adjustedMoney)) throw new Error('跨世金钱写入后回读不一致');
+        }
+        data.moneyInheritance[key] = {
+            status: 'applied',
+            inheritedMoney: transition.inheritedMoney,
+            replacedBodyMoney: transition.committedMoney,
+            adjustedMoney: transition.adjustedMoney,
+            generation: carrierGeneration(record.card, 1),
+            appliedAt: new Date().toISOString(),
+        };
+        saveChatMetadata();
+        if (transition.needsRestore) notify('success', `已继承上一具身体的金钱：${transition.adjustedMoney.toLocaleString()}`);
+        return transition.needsRestore;
+    } finally {
+        moneyInheritanceInFlight = false;
+    }
+}
+
+function portraitKey(body = currentImportedBody()) {
+    if (!body) return '';
+    return body.sourceRecordKey || body.sourceCardFingerprint
+        || `${Number(body.generation) || 1}:${String(body.profile?.姓名 || '当前身体')}`;
+}
+
+function currentPortrait(body = currentImportedBody()) {
+    const key = portraitKey(body);
+    return key ? chatData(false)?.portraits?.[key] || null : null;
+}
+
+async function compressPortrait(file) {
+    if (!file || !/^image\/(?:png|jpe?g|webp|gif)$/i.test(file.type || '')) throw new Error('请选择 PNG、JPG、WebP 或 GIF 图片');
+    if (file.size > 12 * 1024 * 1024) throw new Error('图片不能超过 12MB');
+    const url = URL.createObjectURL(file);
+    try {
+        const image = new Image();
+        image.decoding = 'async';
+        await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = () => reject(new Error('无法读取这张图片'));
+            image.src = url;
+        });
+        const side = Math.min(image.naturalWidth, image.naturalHeight);
+        if (!side) throw new Error('图片尺寸无效');
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 512;
+        const context2d = canvas.getContext('2d');
+        if (!context2d) throw new Error('浏览器无法处理图片');
+        const sx = Math.floor((image.naturalWidth - side) / 2);
+        const sy = Math.floor((image.naturalHeight - side) / 2);
+        context2d.drawImage(image, sx, sy, side, side, 0, 0, 512, 512);
+        let dataUrl = canvas.toDataURL('image/webp', 0.84);
+        if (dataUrl.length > 900000) {
+            canvas.width = 384;
+            canvas.height = 384;
+            context2d.drawImage(image, sx, sy, side, side, 0, 0, 384, 384);
+            dataUrl = canvas.toDataURL('image/webp', 0.72);
+        }
+        if (dataUrl.length > 900000) throw new Error('压缩后图片仍过大，请换一张较小的图片');
+        return dataUrl;
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+
+async function chooseCurrentPortrait() {
+    const body = currentImportedBody();
+    const key = portraitKey(body);
+    if (!key) return notify('warning', '当前还没有已确认的身体，不能保存头像');
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg,image/webp,image/gif';
+    input.addEventListener('change', async () => {
+        try {
+            const dataUrl = await compressPortrait(input.files?.[0]);
+            const data = chatData();
+            data.portraits[key] = {
+                dataUrl,
+                name: body.profile?.姓名 || '当前身体',
+                generation: Number(body.generation) || 1,
+                updatedAt: new Date().toISOString(),
+            };
+            const portraitEntries = Object.entries(data.portraits).sort((a, b) => String(b[1]?.updatedAt || '').localeCompare(String(a[1]?.updatedAt || '')));
+            data.portraits = Object.fromEntries(portraitEntries.slice(0, 20));
+            saveChatMetadata();
+            await render();
+            notify('success', '当前身体头像已保存');
+        } catch (error) {
+            notify('error', error.message || '头像导入失败');
+        }
+    }, { once: true });
+    input.click();
+}
+
+async function removeCurrentPortrait() {
+    const key = portraitKey();
+    const data = chatData();
+    if (!key || !data.portraits?.[key]) return;
+    delete data.portraits[key];
+    saveChatMetadata();
+    await render();
+    notify('success', '当前身体头像已移除');
+}
+
 function dynamicContextText(statData, fullCarrier = false) {
     return JSON.stringify(liveBodyState(statData, { fullCarrier }), null, 2);
 }
@@ -204,7 +333,14 @@ function dynamicContextText(statData, fullCarrier = false) {
 function buildCurrentBodyPrompt(body, statData, mode) {
     if (!body || mode === 'off') return { prompt: '', effectiveMode: body ? '已关闭' : '等待当前身体' };
     const special=specialGeneration(protocolMessages(),statData);
-    if (special) return {prompt:'',effectiveMode:`暂停注入·${special}`};
+    const money = normalizedMoney(statData?.主角?.金钱);
+    const moneyRule = `【跨世金钱｜唯一资源继承例外】\nstat_data.主角.金钱是连续主体跨世保留的余额${money == null ? '' : `，本次确认前余额为 ${money}`}。死亡、候选和确认换身不得用新身体初始现金覆盖、清零或重置它；换身只替换身体绑定资料。新身体原有现金仍属于其客观财产，但不改写这个跨世余额。该规则每次换身只结转一次，普通消费和收入仍按正文正常增减。`;
+    if (special) {
+        if (['等待换身','等待确认','确认交接或重复确认'].includes(special)) {
+            return {prompt:`<legacy_life_money_continuity>\n${moneyRule}\n</legacy_life_money_continuity>`,effectiveMode:`仅金钱保护·${special}`};
+        }
+        return {prompt:'',effectiveMode:`暂停注入·${special}`};
+    }
     if (body.profile?.姓名 && statData?.主角?.载体档案?.姓名 !== body.profile.姓名) return {prompt:'',effectiveMode:'等待MVU当前身体同步'};
     const messages = protocolMessages();
     const profile = JSON.stringify(body.profile || {}, null, 2);
@@ -223,7 +359,8 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         ? (firstSmartTurn ? '智能·换身首轮完整' : '智能·日常精简')
         : mode === 'full' ? '完整' : '精简';
     const prompt = `<legacy_life_current_body>\n这是现实Participant已经确认、由“历代人生管理器”保存的当前身体档案。它是当前有效人物设定，不是候选，也不是前世。历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性不得回流；地点、资源、伤势、状态、身体变化与穿着等易变信息，以“正文实时状态”优先。\n\n【行动—人格协调规则｜每轮强制执行】\n- Participant输入决定“做什么”及最终选择；只要客观上可能，当前身体性格与恐惧不得否决、取消、偷换或强制判定该行动失败。\n- 当前身体的性格、价值观、感情、喜恶、愿望、恐惧、习惯、认知边界与思维方式决定“如何理解和执行”：注意力、风险评估、计划习惯、犹豫或决心、非意志性生理反应、语气与动作节奏都应一致。胆小者可以执行勇敢行动，但可在不撤销行动的前提下体现恐惧、谨慎准备、迟疑或身体紧张。\n- Recorder只能为实现Participant已明确内容，补充最低限度且不改变意图的当下体验与执行质感；不得新增目标、选择、台词、后续主动行动或替Participant改变决定。当前人格造成的是可信阻力与代价，不是行动否决权。\n- 思考与感知必须使用当前身体的词汇、知识边界、价值排序、认知习惯和身体经验；除已归档的重要经历记忆外，不得泄露历代旧人格或旧知识。\n\n【当前人格与思维方式｜每轮有效】\n${behavior}\n\n【${detailTitle}】\n${details}\n\n【正文实时状态】\n${dynamicContextText(statData, mode === 'full')}${historySection}\n</legacy_life_current_body>`;
-    return { prompt, effectiveMode };
+    const guardedPrompt = prompt.replace('\n\n【行动—人格协调规则', `\n\n${moneyRule}\n\n【行动—人格协调规则`);
+    return { prompt: guardedPrompt, effectiveMode };
 }
 
 function recordPromptStats(prompt, requestedMode, effectiveMode) {
@@ -419,6 +556,7 @@ function importSelectedCard(record, mode) {
 async function rebuildFromCurrentChat() {
     if (!globalThis.confirm('根据当前仍然存在的正文楼层，重新建立当前身体和历代人生？\n\n已删除楼层产生的记录会从插件中撤销，但不会删除已经写入世界书的词条。')) return;
     const result = reconcileConversation({ force: true, reason: '手动从当前正文重建' });
+    await applyMoneyInheritance();
     await updateCurrentBodyPrompt();
     await render();
     if (result.current) notify('success', `已按当前正文重建：${result.current.profile?.姓名 || '当前身体'}`);
@@ -522,8 +660,22 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
     const main = summary.main;
     const rowMap = new Map(summary.rows);
     const hero = el('section', 'llm-profile-hero');
-    const orbit = el('div', 'llm-orbit-avatar');
-    orbit.append(el('div', 'llm-silhouette'));
+    const orbit = el('button', 'llm-orbit-avatar');
+    orbit.type = 'button';
+    orbit.title = importedBody ? '点击导入或更换当前身体头像' : '需要先同步一个已确认的当前身体';
+    orbit.disabled = !importedBody;
+    const portrait = currentPortrait(importedBody);
+    if (portrait?.dataUrl) {
+        const image = document.createElement('img');
+        image.className = 'llm-portrait-image';
+        image.src = portrait.dataUrl;
+        image.alt = `${summary.name}的头像`;
+        orbit.append(image);
+    } else {
+        orbit.append(el('div', 'llm-silhouette'));
+    }
+    orbit.append(el('span', 'llm-avatar-edit', portrait?.dataUrl ? '更换' : '导入'));
+    if (importedBody) orbit.addEventListener('click', chooseCurrentPortrait);
     const heroInfo = el('div', 'llm-hero-info');
     heroInfo.append(el('div', 'llm-hero-name', summary.name));
     const chips = el('div', 'llm-chips');
@@ -532,6 +684,10 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
         if (value && value !== '—') chips.append(el('span', 'llm-chip', value));
     }
     heroInfo.append(chips);
+    const portraitActions = el('div', 'llm-portrait-actions');
+    portraitActions.append(el('span', 'llm-muted', '点击头像导入图片；图片仅用于插件显示。'));
+    if (portrait?.dataUrl) portraitActions.append(createButton('移除头像', removeCurrentPortrait, 'menu_button llm-avatar-remove'));
+    heroInfo.append(portraitActions);
     const healthText = String(rowMap.get('健康') || '—');
     const healthMatch = healthText.match(/(?:生命值\s*)?(\d+)\s*\/\s*(\d+)/);
     const healthPercent = healthMatch && Number(healthMatch[2]) > 0
@@ -790,7 +946,8 @@ function scheduleRefresh(reason = '正文楼层变化') {
     const result = reconcileConversation({ reason });
     if (result.cleared) notify('info', '相关人物卡或确认楼层已不存在，插件已撤销旧身体、历代记录和 AI 注入');
     refreshTimers.forEach(clearTimeout);
-    refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(() => {
+    refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(async () => {
+        await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
         render().catch(error => console.error('[历代人生管理器] 渲染失败', error));
         updateCurrentBodyPrompt().catch(error => console.error('[历代人生管理器] 注入失败', error));
         installCardButtons();
@@ -819,12 +976,14 @@ export async function init() {
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
     registerEvents();
     await render();
+    await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
+    await render();
     installCardButtons();
     await updateCurrentBodyPrompt();
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.5.1 已加载');
+    console.log('[历代人生管理器] v0.6.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

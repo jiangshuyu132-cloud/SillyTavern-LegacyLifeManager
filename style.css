@@ -189,11 +189,20 @@
     display: grid;
     width: 132px;
     height: 132px;
+    min-width: 132px;
+    min-height: 132px;
+    padding: 0;
     place-items: center;
     border: 1px solid rgb(225 197 134 / 72%);
     border-radius: 50%;
+    background: rgb(12 15 23 / 72%);
     box-shadow: 0 0 0 13px rgb(213 185 119 / 4%), 0 0 0 25px rgb(213 185 119 / 3%);
+    cursor: pointer;
+    appearance: none;
 }
+
+.llm-orbit-avatar:disabled { cursor: default; opacity: 1; }
+.llm-orbit-avatar:not(:disabled):hover { border-color: var(--llm-accent-bright); box-shadow: 0 0 0 13px rgb(154 120 255 / 6%), 0 0 0 25px rgb(213 185 119 / 3%), 0 0 22px rgb(154 120 255 / 20%); }
 
 .llm-orbit-avatar::before {
     position: absolute;
@@ -234,6 +243,31 @@
     background: linear-gradient(145deg, #777b8d, #3f4454);
     content: '';
 }
+
+.llm-portrait-image {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
+.llm-avatar-edit {
+    position: absolute;
+    right: -5px;
+    bottom: 5px;
+    z-index: 2;
+    padding: 0.22rem 0.48rem;
+    border: 1px solid rgb(177 151 255 / 70%);
+    border-radius: 999px;
+    background: rgb(29 24 48 / 94%);
+    color: #d7caff;
+    font-size: 0.65rem;
+    line-height: 1.2;
+    box-shadow: 0 3px 10px rgb(0 0 0 / 35%);
+}
+
+.llm-portrait-actions { display: flex; margin-top: 0.55rem; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+#legacy-life-manager-root .llm-avatar-remove { min-height: 28px; padding: 0.25rem 0.55rem; font-size: 0.7rem; }
 
 .llm-hero-info { position: relative; z-index: 1; min-width: 0; }
 .llm-hero-name {
@@ -426,7 +460,7 @@
     .llm-brand-title { font-size: 0.98rem; letter-spacing: 0.03em; }
     .llm-sync { font-size: 0; }
     .llm-profile-hero { min-height: 0; grid-template-columns: 92px minmax(0, 1fr); padding: 1rem; }
-    .llm-orbit-avatar { width: 82px; height: 82px; }
+    .llm-orbit-avatar { width: 82px; height: 82px; min-width: 82px; min-height: 82px; }
     .llm-orbit-avatar::after { box-shadow: 0 0 8px var(--llm-gold), 0 94px 0 var(--llm-gold); }
     .llm-silhouette { width: 34px; height: 34px; margin-top: -18px; }
     .llm-silhouette::after { top: 29px; left: -13px; width: 60px; height: 38px; }

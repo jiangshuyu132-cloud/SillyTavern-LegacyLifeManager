@@ -5,6 +5,7 @@ import {
     isDiscussion,
     schemaStrippedCommitEvidence,
     schemaStrippedConfirmationGate,
+    messageStat,
 } from './strict-protocol.js';
 export const ARCHIVE_PREFIX = '[历代记忆档案]';
 
@@ -209,6 +210,45 @@ export function formatSummaryValue(value, fallback = '当前变量未提供') {
     return text || fallback;
 }
 
+export function normalizedMoney(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value !== 'string') return null;
+    const source = value.trim().replace(/,/g, '');
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(source)) return null;
+    const number = Number(source);
+    return Number.isFinite(number) ? number : null;
+}
+
+/**
+ * Money is the one body-independent resource managed by this extension.
+ * The value immediately before the exact confirmation is authoritative; the
+ * new body's cash remains part of its ordinary property instead of replacing
+ * this cross-life balance.
+ */
+export function crossLifeMoneyTransition(messages = [], record = null) {
+    if (!record || !Number.isInteger(record.confirmationIndex) || !Number.isInteger(record.commitIndex)) return null;
+    const timeline = protocolTimeline(messages, { storedOnly: true });
+    const before = timeline[record.confirmationIndex - 1] || messageStat(messages[record.cardIndex]) || {};
+    const after = timeline[record.commitIndex] || messageStat(messages[record.commitIndex]) || {};
+    const latest = timeline.at(-1) || after;
+    const inheritedMoney = normalizedMoney(before?.主角?.金钱);
+    const committedMoney = normalizedMoney(after?.主角?.金钱);
+    const currentMoney = normalizedMoney(latest?.主角?.金钱);
+    if (inheritedMoney == null || committedMoney == null || currentMoney == null) return null;
+    let adjustedMoney = currentMoney;
+    if (!Object.is(committedMoney, inheritedMoney) && !Object.is(currentMoney, inheritedMoney)) {
+        const adjusted = inheritedMoney + (currentMoney - committedMoney);
+        if (Number.isFinite(adjusted)) adjustedMoney = adjusted;
+    }
+    return {
+        inheritedMoney,
+        committedMoney,
+        currentMoney,
+        adjustedMoney,
+        needsRestore: !Object.is(currentMoney, adjustedMoney),
+    };
+}
+
 function resourceMaximum(resource) {
     const maximum = asObject(resource?.上限);
     const base = Number(maximum?._基础);
@@ -252,6 +292,7 @@ export function currentBodySummary(statData = {}, supplementalProfile = {}, opti
             ['种族', formatSummaryValue(preferSupplemental ? (supplemental.种族 || main.种族) : (hasCarrierProfile ? main.种族 : (supplemental.种族 || main.种族)))],
             ['身份', formatSummaryValue(preferSupplemental ? (supplemental.身份 || main.身份) : (hasCarrierProfile ? main.身份 : (supplemental.身份 || main.身份)), '暂无身份')],
             ['职业', formatSummaryValue(preferSupplemental ? (supplemental.职业 || main.职业) : (hasCarrierProfile ? main.职业 : (supplemental.职业 || main.职业)), '暂无职业')],
+            ['跨世金钱', formatSummaryValue(main.金钱)],
             ['地点', formatSummaryValue(main.当前地点 || liveProfile.当前地点与处境 || getPath(statData, '世界.当前地点') || getPath(statData, '世界.地点') || supplemental.地点)],
             ['健康', formatSummaryValue(health)],
         ],

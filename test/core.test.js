@@ -13,6 +13,7 @@ import {
     confirmedCarrierProfile,
     confirmedCarrierRecords,
     conversationLedgerTruth,
+    crossLifeMoneyTransition,
     currentBehaviorProfile,
     currentBodySummary,
     detectCarryover,
@@ -29,6 +30,7 @@ import {
     lifeSummariesFromUpdateVariable,
     liveBodyState,
     mergeLifeRecords,
+    normalizedMoney,
     normalizeEntries,
     normalizeStage,
     formatSummaryValue,
@@ -384,6 +386,23 @@ test('schema recovery still rejects text-only claims without a stored death-to-l
     assert.equal(confirmedCarrierRecords(noStoredEvidence).length, 0);
 });
 
+test('cross-life money keeps the exact pre-confirmation balance', () => {
+    const messages = confirmedFixture();
+    messages[0].stat_data.主角.金钱 = 123456;
+    messages[1].stat_data = structuredClone(messages[0].stat_data);
+    messages[2].stat_data.主角.金钱 = 800;
+    const record = confirmedCarrierRecords(messages)[0];
+    assert.deepEqual(crossLifeMoneyTransition(messages, record), {
+        inheritedMoney: 123456,
+        committedMoney: 800,
+        currentMoney: 800,
+        adjustedMoney: 123456,
+        needsRestore: true,
+    });
+    assert.equal(normalizedMoney('1e122'), 1e122);
+    assert.equal(normalizedMoney('不是金额'), null);
+});
+
 test('narrative death and confirmation without real state cannot fabricate a commit', () => {
     const noHistoryCard = actualCarrierCardVariant.replace(/<b>===== 历代经历记忆 =====<\/b>[\s\S]*?<b>===== 不继承声明 =====<\/b>/, '<b>===== 不继承声明 =====</b>');
     const lives = rebuildConversationLives([
@@ -498,7 +517,7 @@ test('currentBodySummary prefers the new carrier profile', () => {
     assert.equal(result.name, '林');
     assert.deepEqual(Object.fromEntries(result.rows), {
         原主: '当前变量未提供', 年龄: '20', 性别: '当前变量未提供', 种族: '精灵',
-        身份: '旅人', 职业: '法师', 地点: '旅店', 健康: '健康',
+        身份: '旅人', 职业: '法师', 跨世金钱: '当前变量未提供', 地点: '旅店', 健康: '健康',
     });
 });
 
@@ -534,7 +553,7 @@ test('currentBodySummary merges a legacy chat character card without replacing l
     assert.equal(result.usedSupplementalProfile, true);
     assert.deepEqual(Object.fromEntries(result.rows), {
         原主: '江书宇', 年龄: '16岁', 性别: '男', 种族: '人类（异世界来客）',
-        身份: '无', 职业: '无（原世界学生）', 地点: '城防值班室',
+        身份: '无', 职业: '无（原世界学生）', 跨世金钱: '当前变量未提供', 地点: '城防值班室',
         健康: '生命值 206/206 · 无状态效果',
     });
 });
