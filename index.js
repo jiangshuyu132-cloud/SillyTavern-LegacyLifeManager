@@ -164,6 +164,17 @@ function backupLedger(data, reason) {
     data.backups = data.backups.slice(-5);
 }
 
+function trustedCarrierOptions(data = chatData(false)) {
+    const keys = [];
+    const bodies = [data?.currentBody, ...(data?.backups || []).map(item => item?.currentBody)];
+    for (const body of bodies) {
+        if (body?.confirmed === true && body?.sourceType === 'conversation' && body?.sourceRecordKey) {
+            keys.push(body.sourceRecordKey);
+        }
+    }
+    return { trustedRecordKeys: [...new Set(keys)] };
+}
+
 function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
     const sourceRecordKey = carrierRecordKey(record, messages);
     return {
@@ -186,7 +197,7 @@ function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
 function reconcileConversation({ force = false, reason = '自动对账' } = {}) {
     const data = chatData();
     const messages = protocolMessages();
-    const truth = conversationLedgerTruth(messages, force ? [] : data.suppressedRecordKeys);
+    const truth = conversationLedgerTruth(messages, force ? [] : data.suppressedRecordKeys, trustedCarrierOptions(data));
     const records = truth.records;
     const record = truth.currentRecord;
     const previous = data.currentBody;
@@ -216,7 +227,7 @@ async function applyMoneyInheritance() {
     if (moneyInheritanceInFlight) return false;
     const data = chatData();
     const messages = protocolMessages();
-    const record = conversationLedgerTruth(messages, data.suppressedRecordKeys).currentRecord;
+    const record = conversationLedgerTruth(messages, data.suppressedRecordKeys, trustedCarrierOptions(data)).currentRecord;
     if (!record) return false;
     const key = carrierRecordKey(record, messages);
     if (!key || data.moneyInheritance?.[key]?.status === 'applied') return false;
@@ -457,7 +468,7 @@ async function archivePendingLife() {
         const statData=mvu.readStatDataAt(messageIndex);
         const pending=archiveGate(statData);
         if (!pending) throw new Error('当前消息MVU未证实有效待归档人生；先等待变量写回，草稿不会丢弃');
-        const records=confirmedCarrierRecords(protocolMessages());
+        const records=confirmedCarrierRecords(protocolMessages(), trustedCarrierOptions());
         if (!records.some(record => carrierGeneration(record.card,0) === pending.generation+1)) throw new Error('缺少可核实的死亡、候选、精确确认及提交链，已停止归档');
         const {draft:content,title,generation}=pending;
         const name=currentWorldBookName();
@@ -565,7 +576,7 @@ function availableCarrierCards() {
 function importSelectedCard(record, mode) {
     if (!record) return notify('warning','没有选择人物卡');
     const messages=protocolMessages();
-    const valid=confirmedCarrierRecords(messages).find(item => item.cardIndex===record.messageIndex && stableTextFingerprint(item.card)===stableTextFingerprint(record.card));
+    const valid=confirmedCarrierRecords(messages, trustedCarrierOptions()).find(item => item.cardIndex===record.messageIndex && stableTextFingerprint(item.card)===stableTextFingerprint(record.card));
     if (!valid) return notify('warning','这仍是候选或提交链不完整。请在有效死亡和待确认状态下亲自发送精确口令“确认换身”，等待MVU提交后再同步。按钮不会替你确认。');
     reconcileConversation({force:true,reason:'同步已确认档案'});
     updateCurrentBodyPrompt();render();
@@ -587,7 +598,7 @@ async function clearCurrentChatLedger() {
     const data = chatData();
     const messages = protocolMessages();
     backupLedger(data, '手动清空本聊天插件记录');
-    data.suppressedRecordKeys = confirmedCarrierRecords(messages).map(record => carrierRecordKey(record, messages));
+    data.suppressedRecordKeys = confirmedCarrierRecords(messages, trustedCarrierOptions(data)).map(record => carrierRecordKey(record, messages));
     data.currentBody = null;
     data.lives = [];
     saveChatMetadata();
@@ -670,7 +681,7 @@ function el(tag, className, text) {
 function renderCurrent(panel, statData, runtimeInfo = {}) {
     const messages = protocolMessages();
     const importedBody = currentImportedBody();
-    const confirmedProfile = confirmedCarrierProfile(messages);
+    const confirmedProfile = confirmedCarrierProfile(messages, trustedCarrierOptions());
     const importedProfile = asObject(importedBody?.profile);
     const hasImportedProfile = Object.keys(importedProfile).length > 0;
     const hasConfirmedProfile = Object.keys(confirmedProfile).length > 0;
@@ -1006,7 +1017,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.7.0 已加载');
+    console.log('[历代人生管理器] v0.7.1 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

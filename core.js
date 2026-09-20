@@ -557,9 +557,40 @@ export function unvalidatedCarrierRecords(messages = []) {
     return records;
 }
 
-export function confirmedCarrierRecords(messages = []) {
+function comparableCarrierValue(value) {
+    if (Array.isArray(value)) return value.map(comparableCarrierValue).filter(Boolean).join('、');
+    return String(value ?? '').replace(/\s+/g, '').trim();
+}
+
+function carrierValuesMatch(left, right) {
+    const a = comparableCarrierValue(left), b = comparableCarrierValue(right);
+    return Boolean(a && b && (a === b || a.includes(b) || b.includes(a)));
+}
+
+function trustedCarrierMatchesCurrentState(stat, profile = {}) {
+    const main = asObject(stat?.主角);
+    const carrier = asObject(main.载体档案);
+    const hp = Number(main?.生命值?.当前);
+    if (Number.isFinite(hp) && hp <= 0) return false;
+
+    let matched = 0;
+    for (const [stored, expected] of [
+        [carrier.姓名 || main.姓名, profile.姓名],
+        [carrier.种族 || main.种族, profile.种族],
+        [carrier.职业 || main.职业, profile.职业],
+    ]) {
+        if (!comparableCarrierValue(stored) || !comparableCarrierValue(expected)) continue;
+        if (!carrierValuesMatch(stored, expected)) return false;
+        matched += 1;
+    }
+    return matched > 0;
+}
+
+export function confirmedCarrierRecords(messages = [], options = {}) {
     const timeline = protocolTimeline(messages, {storedOnly:true});
     const recoveredTimeline = protocolTimeline(messages, {recoverMissingProtocol:true});
+    const trustedRecordKeys = new Set(options?.trustedRecordKeys || []);
+    const currentStoredState = timeline.at(-1) || {};
     const accepted = [], consumed = new Set();
     for (const item of unvalidatedCarrierRecords(messages)) {
         if (isDiscussion(messages[item.cardIndex]) || isDiscussion(messages[item.confirmationIndex])) continue;
@@ -578,9 +609,15 @@ export function confirmedCarrierRecords(messages = []) {
             if (messages[i]?.is_user && !messages[i].is_system) break;
             if (messages[i]?.is_system || isDiscussion(messages[i])) continue;
             const after = recovery ? recoveredTimeline[i] : timeline[i];
-            const storedEvidence = !recovery || schemaStrippedCommitEvidence(messages,item.cardIndex,i,item.profile);
+            const recordKey = carrierRecordKey(item, messages);
+            const trustedBackupEvidence = recovery
+                && trustedRecordKeys.has(recordKey)
+                && trustedCarrierMatchesCurrentState(currentStoredState, item.profile);
+            const storedEvidence = !recovery
+                || schemaStrippedCommitEvidence(messages,item.cardIndex,i,item.profile)
+                || trustedBackupEvidence;
             if (storedEvidence && commitGate(before,after,item.profile,generation)) {
-                accepted.push({...item, commitIndex:i}); consumed.add(generation); committed=true; break;
+                accepted.push({...item, commitIndex:i, recoveredFromTrustedBackup:trustedBackupEvidence}); consumed.add(generation); committed=true; break;
             }
         }
         // A bare confirmation message or an incomplete/failed MVU update is not a commit.
@@ -737,9 +774,9 @@ export function rebuildConversationLives(messages = [], records = confirmedCarri
     return mergeLifeRecords(collected);
 }
 
-export function conversationLedgerTruth(messages = [], suppressedRecordKeys = []) {
+export function conversationLedgerTruth(messages = [], suppressedRecordKeys = [], options = {}) {
     const suppressed = new Set(suppressedRecordKeys || []);
-    const records = confirmedCarrierRecords(messages)
+    const records = confirmedCarrierRecords(messages, options)
         .filter(record => !suppressed.has(carrierRecordKey(record, messages)));
     return {
         records,
@@ -748,8 +785,8 @@ export function conversationLedgerTruth(messages = [], suppressedRecordKeys = []
     };
 }
 
-export function confirmedCarrierProfile(messages = []) {
-    return confirmedCarrierRecords(messages).at(-1)?.profile || {};
+export function confirmedCarrierProfile(messages = [], options = {}) {
+    return confirmedCarrierRecords(messages, options).at(-1)?.profile || {};
 }
 
 export function lifeSummariesFromCarrierCard(card) {

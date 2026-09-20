@@ -43,6 +43,7 @@ import {
     smartInjectionUsesFullCard,
     supplementalPlayerProfile,
     upsertArchive,
+    unvalidatedCarrierRecords,
 } from '../core.js';
 import { createMvuAdapter, statDataFromMessage, statDataFromVariables } from '../mvu-adapter.js';
 
@@ -389,6 +390,48 @@ test('schema recovery still rejects text-only claims without a stored death-to-l
         { is_user: false, mes: '<UpdateVariable><JSONPatch>[]</JSONPatch></UpdateVariable>' },
     ];
     assert.equal(confirmedCarrierRecords(noStoredEvidence).length, 0);
+});
+
+test('trusted plugin backup safely restores a schema-stripped confirmed carrier after refresh', () => {
+    const card = `【当前载体人物设定开始】
+<div><b>世代编号：</b>第2世<br><b>姓名：</b>芙莉莲<br><b>种族：</b>高等精灵<br><b>职业：</b>法师<br><b>当前地点：</b>彩玉区出租屋</div>
+【当前载体人物设定结束】`;
+    const candidatePatch = `<UpdateVariable><JSONPatch>${JSON.stringify([
+        { op: 'replace', path: '/主角/换身状态', value: { 阶段: '等待确认', 当前世代编号: 1, 当前身体死亡已确认: true, 当前身体死亡信息: '已死亡', 待确认人物卡: '【候选】芙莉莲，高等精灵女性，法师。详细设定见正文候选卡。', 待归档人生词条: '', 归档写入状态: '无待处理' } },
+    ])}</JSONPatch></UpdateVariable>`;
+    const commitPatch = `<UpdateVariable><JSONPatch>${JSON.stringify([
+        { op: 'replace', path: '/主角/换身状态', value: { 阶段: '当前身体生效', 当前世代编号: 2, 当前身体死亡已确认: false, 当前身体死亡信息: '', 待确认人物卡: '', 待归档人生词条: '词条名称: 第1世·旧身\n经历', 归档写入状态: '待写入世界书' } },
+        { op: 'replace', path: '/主角/载体档案', value: { 姓名: '芙莉莲', 种族: '高等精灵', 职业: '法师', 地点: '彩玉区出租屋' } },
+        { op: 'insert', path: '/历代记忆摘要/-', value: { 世代编号: 1, 身体姓名: '旧身', 详细词条名称: '第1世·旧身' } },
+    ])}</JSONPatch></UpdateVariable>`;
+    const deadStored = { 主角: { 种族: '人类', 职业: [], 生命值: { 当前: 0 } }, 世界: { 地点: '暗巷' } };
+    const liveStored = { 主角: { 种族: '高等精灵', 职业: ['法师'], 生命值: { 当前: 535 } }, 世界: { 地点: '炼金公会' } };
+    const messages = [
+        { is_user: false, mes: `${card}${candidatePatch}`, send_date: 'card', stat_data: deadStored },
+        { is_user: true, mes: '确认换身', send_date: 'confirm' },
+        { is_user: false, mes: commitPatch, send_date: 'commit' },
+        { is_user: true, mes: '继续生活', send_date: 'later-user' },
+        { is_user: false, mes: '来到炼金公会。', send_date: 'later-assistant', stat_data: liveStored },
+    ];
+    const provisional = unvalidatedCarrierRecords(messages)[0];
+    const trustedKey = carrierRecordKey(provisional, messages);
+
+    assert.equal(confirmedCarrierRecords(messages).length, 0);
+    const recovered = confirmedCarrierRecords(messages, { trustedRecordKeys: [trustedKey] });
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].profile.姓名, '芙莉莲');
+    assert.equal(recovered[0].recoveredFromTrustedBackup, true);
+
+    const editedConfirmation = structuredClone(messages);
+    editedConfirmation[1].send_date = 'different-confirmation';
+    assert.equal(confirmedCarrierRecords(editedConfirmation, { trustedRecordKeys: [trustedKey] }).length, 0);
+
+    const mismatchedCurrentBody = structuredClone(messages);
+    mismatchedCurrentBody[4].stat_data.主角.种族 = '人类';
+    assert.equal(confirmedCarrierRecords(mismatchedCurrentBody, { trustedRecordKeys: [trustedKey] }).length, 0);
+
+    const deletedConfirmation = messages.filter((_, index) => index !== 1);
+    assert.equal(confirmedCarrierRecords(deletedConfirmation, { trustedRecordKeys: [trustedKey] }).length, 0);
 });
 
 test('cross-life money keeps the exact pre-confirmation balance', () => {

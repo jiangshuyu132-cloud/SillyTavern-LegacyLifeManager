@@ -59,3 +59,14 @@ test('严格主档案每轮发送完整人物卡并保留正文变量模块',()=
  assert.match(prompt.prompt,/物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场/);
  assert.match(prompt.prompt,/【当前载体人物设定开始】/);
 });
+test('刷新时用可信备份恢复缺少提交层快照的有效换身，删除确认层仍撤销',()=>{
+ const after=setup();plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;
+ data.backups=[{at:new Date().toISOString(),reason:'测试安全备份',currentBody:structuredClone(data.currentBody),lives:structuredClone(data.lives)}];data.currentBody=null;data.lives=[];
+ const waiting={阶段:'等待确认',当前世代编号:1,当前身体死亡已确认:true,当前身体死亡信息:'已死亡',待确认人物卡:'【候选】新身体。详细设定见正文候选卡。',待归档人生词条:'',归档写入状态:'无待处理'};
+ const active={阶段:'当前身体生效',当前世代编号:2,当前身体死亡已确认:false,当前身体死亡信息:'',待确认人物卡:'',待归档人生词条:draft,归档写入状态:'待写入世界书'};
+ ctx.chat[0].stat_data={主角:{生命值:{当前:0}}};ctx.chat[0].mes=card+`<UpdateVariable><JSONPatch>${JSON.stringify([{op:'replace',path:'/主角/换身状态',value:waiting}])}</JSONPatch></UpdateVariable>`;
+ delete ctx.chat[2].stat_data;ctx.chat[2].mes=`<UpdateVariable><JSONPatch>${JSON.stringify([{op:'replace',path:'/主角/换身状态',value:active},{op:'replace',path:'/主角/载体档案',value:{姓名:'新身体'}},{op:'insert',path:'/历代记忆摘要/-',value:{世代编号:1,身体姓名:'旧身体',详细词条名称:'第1世·旧身体'}}])}</JSONPatch></UpdateVariable>`;
+ ctx.chat.push({is_user:true,mes:'继续生活'},{is_user:false,mes:'后续正文',stat_data:{主角:{载体档案:{姓名:'新身体'},生命值:{当前:100}}}});
+ const restored=plugin.reconcileConversation();assert.equal(restored.current.profile.姓名,'新身体');assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
+ ctx.chat.splice(1,1);const cleared=plugin.reconcileConversation();assert.equal(cleared.cleared,true);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
+});
