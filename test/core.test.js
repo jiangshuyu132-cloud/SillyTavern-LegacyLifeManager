@@ -5,6 +5,7 @@ import {
     archiveTitle,
     asObject,
     buildLifeRecord,
+    carrierBackgroundStory,
     carrierGeneration,
     carrierCardSections,
     carrierCardText,
@@ -173,6 +174,22 @@ test('current behavior profile keeps all decision-lens fields and prefers live d
     }, { preferCard: true });
     assert.match(strict.性格与价值观, /被逼到底线/);
     assert.doesNotMatch(strict.性格与价值观, /变量里的简略/);
+});
+
+test('carrier background story extracts the dedicated birth-to-current-age section', () => {
+    const card = `
+— 当前形态基础 —
+<b>姓名：</b>莉安<br>
+— 人生背景 —
+<b>出生与家庭：</b>出生在河港工匠家庭。<br>
+<b>成长与教育：</b>七岁开始跟随母亲学习记账，十五岁成为行会学徒。<br>
+<b>接管前经历：</b>二十岁时独自经营修补摊。<br>
+— 外貌详述 —
+棕发灰眼。`;
+    const result = carrierBackgroundStory(card);
+    assert.match(result, /出生在河港工匠家庭/);
+    assert.match(result, /二十岁时独自经营修补摊/);
+    assert.doesNotMatch(result, /棕发灰眼/);
 });
 
 test('normalizeStage accepts only protocol stages', () => {

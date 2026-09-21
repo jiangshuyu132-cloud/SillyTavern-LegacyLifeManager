@@ -5,6 +5,7 @@ import {
     archiveTitle,
     asObject,
     buildLifeRecord,
+    carrierBackgroundStory,
     carrierGeneration,
     carrierCardSections,
     carrierCardText,
@@ -40,7 +41,7 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 7, injectionMode: 'strict' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 8, injectionMode: 'strict' });
 let initialized = false;
 let archiveInFlight = false;
 let moneyInheritanceInFlight = false;
@@ -48,6 +49,8 @@ let refreshTimers = [];
 let lastNotification = { key: '', at: 0 };
 let lastPromptText = '';
 let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'strict', effectiveMode: '等待当前身体', injected: false, sourceFloor: 0, appliedOperations: 0 };
+let floatingPanelHome = null;
+let floatingPanelPlaceholder = null;
 
 function context() {
     return globalThis.SillyTavern?.getContext?.();
@@ -74,6 +77,10 @@ function settings() {
         current.dataVersion = 7;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 8) {
+        current.dataVersion = 8;
+        ctx.saveSettingsDebounced?.();
+    }
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
     return current;
 }
@@ -82,7 +89,7 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 7, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {} };
+        ctx.chatMetadata[METADATA_KEY] = { version: 8, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {} };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
@@ -92,7 +99,7 @@ function chatData(create = true) {
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 7;
+        data.version = 8;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -202,6 +209,7 @@ function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
         rawCard: record.card,
         text: carrierCardText(record.card),
         sections: carrierCardSections(record.card),
+        backgroundStory: carrierBackgroundStory(record.card),
         sourceMessageIndex: record.cardIndex,
         confirmationMessageIndex: record.confirmationIndex,
         sourceCardFingerprint: stableTextFingerprint(record.card),
@@ -387,6 +395,10 @@ function buildCurrentBodyPrompt(body, statData, mode) {
     const useFullCard = strict || mode === 'full' || firstSmartTurn;
     const details = useFullCard ? body.text : profile;
     const detailTitle = useFullCard ? '完整当前身体档案' : '当前身体核心档案';
+    const backgroundStory = String(body.backgroundStory || carrierBackgroundStory(body.rawCard || body.text) || '').trim();
+    const backgroundSection = backgroundStory
+        ? `\n\n【当前身体人生背景｜出生至接管年龄｜每轮有效】\n这是当前原主在接管前真实经历的人生连续史，用于约束其记忆、关系、知识来源、习惯、创伤、能力来源与当前处境。不得把它误当成前世经历，也不得用历代旧人格或旧技能补写空白。正文后来明确发生的新经历可以继续发展，但不得无故重写已经确认的出生与成长事实。\n${backgroundStory}`
+        : '';
     const histories = (mode === 'smart' && !firstSmartTurn) || mode === 'compact'
         ? compactLifeIndex(mergeLifeRecords(chatData(false)?.lives || [], inferredLivesFromCarrierCard(body.rawCard)), 1200)
         : '';
@@ -399,12 +411,15 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         : mode === 'full' ? '完整' : '精简';
     const authorityRules = `【资料来源合并与优先级｜每轮强制执行】
 - 必须同时读取本插件档案与正文已有的 <status_current_variables>/stat_data；“插件档案优先”不表示关闭、忽略或删除正文角色面板。
-- 对姓名、种族、身份背景、外貌、声音、气味、身体结构、卫生、长期疾病的完整表现、性格、记忆、认知、感情、习惯、知识语言及其它详细人物设定，本插件的已确认完整档案是主档案。同名正文变量若更短、更概括或缺字段，只能作为实时补充，不得缩写、抹除、降格或覆盖插件细节。
+- 对姓名、种族、身份背景、从出生到接管年龄的人生背景、外貌、声音、气味、身体结构、卫生、长期疾病的完整表现、性格、记忆、认知、感情、习惯、知识语言及其它详细人物设定，本插件的已确认完整档案是主档案。同名正文变量若更短、更概括或缺字段，只能作为实时补充，不得缩写、抹除、降格或覆盖插件细节。
 - 对世界时间、当前地点、生命/法力/体力、等级属性、金钱、物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场、好感度、当前想法，以及正文中新发生并已写入变量的获得、消耗、损坏、治愈、移除、恶化等动态事实，以最新 stat_data 为准。
 - 状态效果必须合并：stat_data 决定当前是否存在、层数、剩余时间与即时严重度；插件档案提供完整症状、身体表现、长期影响与叙事细节。简短状态条不得覆盖详细档案；变量明确治愈或移除后也不得因旧档案继续视为仍生效。正文新增而插件原卡没有的状态必须接受。
 - 技能与人物关系同样合并：当前可用技能、数值、在场、好感度和即时想法以变量为准；插件档案中的能力背景、使用习惯、长期关系、记忆与感情提供详细语义。若出现无法按上述类型解决的真实冲突，明确指出冲突，不得默默选择较短文本。`;
     const prompt = `<legacy_life_current_body>\n这是现实Participant已经确认、由“历代人生管理器”保存并在本轮生成前重新合并的当前有效身体档案。它已经实际进入本轮 AI 上下文，不是只供插件界面显示的记录；也不是候选或前世。历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性不得回流；下方“当前有效动态覆盖”是截至本轮最新正文的执行值。\n\n【行动—人格协调规则｜每轮强制执行】\n- Participant输入决定“做什么”及最终选择；只要客观上可能，当前身体性格与恐惧不得否决、取消、偷换或强制判定该行动失败。\n- 当前身体的性格、价值观、感情、喜恶、愿望、恐惧、习惯、认知边界与思维方式决定“如何理解和执行”：注意力、风险评估、计划习惯、犹豫或决心、非意志性生理反应、语气与动作节奏都应一致。胆小者可以执行勇敢行动，但可在不撤销行动的前提下体现恐惧、谨慎准备、迟疑或身体紧张。\n- Recorder只能为实现Participant已明确内容，补充最低限度且不改变意图的当下体验与执行质感；不得新增目标、选择、台词、后续主动行动或替Participant改变决定。当前人格造成的是可信阻力与代价，不是行动否决权。\n- 思考与感知必须使用当前身体的词汇、知识边界、价值排序、认知习惯和身体经验；除已归档的重要经历记忆外，不得泄露历代旧人格或旧知识。\n\n【当前人格与思维方式｜每轮有效】\n${behavior}\n\n【${detailTitle}】\n${details}\n\n【当前有效动态覆盖｜本轮必须执行】\n以下内容已在生成前从最新 stat_data 及尚待 MVU 落盘的安全正文变量更新中重新计算。它不是历史备注：伤势、疾病是否仍生效、卫生、穿着、形态、改造、位置、资源和数值必须按这里的当前值续写；明确移除的状态不得从接管时原卡复活。\n${dynamicContextText(statData, mode === 'full')}${historySection}\n</legacy_life_current_body>`;
-    const authoritativePrompt = prompt
+    const promptWithBackground = backgroundSection
+        ? prompt.replace('\n\n【行动—人格协调规则', `${backgroundSection}\n\n【行动—人格协调规则`)
+        : prompt;
+    const authoritativePrompt = promptWithBackground
         .replace('<legacy_life_current_body>', '<legacy_life_current_body authority="confirmed-plugin-dossier-first">')
         .replace('\n\n【行动—人格协调规则', `\n\n${authorityRules}\n\n【行动—人格协调规则`);
     const guardedPrompt = authoritativePrompt.replace('\n\n【行动—人格协调规则', `\n\n${moneyRule}\n\n【行动—人格协调规则`);
@@ -640,6 +655,7 @@ function renderFullBody(panel, body) {
     const intro = el('div', 'llm-muted', '下列折叠项保留接管时的详细基础设定；上方“当前有效动态覆盖”会随正文更新并在同一轮提示中覆盖旧伤势、疾病状态、卫生、穿着、形态和改造。界面显示与 AI 实际接收使用同一份合并数据。');
     const sections = el('div', 'llm-sections');
     for (const section of body.sections || carrierCardSections(body.rawCard)) {
+        if (/^(?:人生背景|背景故事|生平经历|成长经历)$/.test(String(section.title || '').trim())) continue;
         const details = document.createElement('details');
         details.className = 'llm-life llm-section';
         details.append(el('summary', '', section.title), el('div', 'llm-section-content', section.content));
@@ -649,6 +665,23 @@ function renderFullBody(panel, body) {
     raw.className = 'llm-life';
     raw.append(el('summary', '', '查看完整原始人物卡文本'), el('pre', 'llm-json', body.text));
     panel.append(heading, intro, sections, raw);
+}
+
+function renderBackgroundStory(panel, body) {
+    if (!body) return;
+    const story = String(body.backgroundStory || carrierBackgroundStory(body.rawCard || body.text) || '').trim();
+    if (!story) {
+        panel.append(el('div', 'llm-background-empty', '这具身体来自旧版人物卡，尚未包含“出生至当前年龄”的独立人生背景。下一次生成新身体时会自动加入。'));
+        return;
+    }
+    panel.append(el('h3', 'llm-section-title', '当前身体人生背景（每轮发送给 AI）'));
+    const details = document.createElement('details');
+    details.className = 'llm-background-story';
+    details.append(
+        el('summary', '', '查看从出生到接管年龄的完整背景'),
+        el('div', 'llm-background-content', story),
+    );
+    panel.append(details);
 }
 
 function runtimeValueText(value) {
@@ -773,6 +806,7 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
     details.append(el('summary', '', '查看完整 stat_data.主角'), el('pre', 'llm-json', pretty(main)));
     const warnings = carryoverWarnings(statData);
     panel.append(hero, grid);
+    renderBackgroundStory(panel, importedBody);
     if (summary.usedSupplementalProfile) {
         panel.append(el('div', 'llm-muted', hasImportedProfile
             ? '完整身份资料来自插件保存的当前人物卡；地点、资源与状态读取最新 stat_data。'
@@ -868,7 +902,7 @@ function renderSettings(panel) {
         updateCurrentBodyPrompt();
     });
     injectionLabel.append(injection);
-    const injectionHelp = el('div', 'llm-muted', '严格主档案模式在每次生成前重新合并并发送完整人物卡与当前有效动态覆盖；正文 stat_data 的物品、任务、关系、新闻等模块仍会一起读取。身份必须经过确认链，伤势、卫生、穿着、形态等安全动态可紧跟最新正文。');
+    const injectionHelp = el('div', 'llm-muted', '严格主档案模式在每次生成前重新合并并发送完整人物卡、出生至接管年龄的人生背景与当前有效动态覆盖；正文 stat_data 的物品、任务、关系、新闻等模块仍会一起读取。身份必须经过确认链，伤势、卫生、穿着、形态等安全动态可紧跟最新正文。');
     const promptMeter = el('div', 'llm-prompt-meter', promptStatsText());
     const promptPreview = document.createElement('details');
     promptPreview.className = 'llm-prompt-preview';
@@ -946,6 +980,66 @@ function createPanel() {
     drawer.append(header, body);
     root.append(drawer);
     return root;
+}
+
+function closeFloatingPanel() {
+    const overlay = document.getElementById('legacy-life-manager-floating-overlay');
+    const root = document.getElementById('legacy-life-manager-root');
+    if (root && floatingPanelPlaceholder?.parentNode) {
+        floatingPanelPlaceholder.parentNode.insertBefore(root, floatingPanelPlaceholder);
+        floatingPanelPlaceholder.remove();
+    } else if (root && floatingPanelHome?.isConnected) {
+        floatingPanelHome.append(root);
+    }
+    floatingPanelPlaceholder = null;
+    floatingPanelHome = null;
+    if (overlay) overlay.hidden = true;
+    document.body?.classList.remove('llm-floating-open');
+}
+
+async function openFloatingPanel() {
+    const root = document.getElementById('legacy-life-manager-root');
+    const host = document.querySelector('#legacy-life-manager-floating-overlay .llm-floating-panel-host');
+    const overlay = document.getElementById('legacy-life-manager-floating-overlay');
+    if (!root || !host || !overlay) return;
+    if (!floatingPanelPlaceholder) {
+        floatingPanelHome = root.parentElement;
+        floatingPanelPlaceholder = document.createComment('legacy-life-manager-panel-home');
+        root.parentNode?.insertBefore(floatingPanelPlaceholder, root);
+        host.append(root);
+    }
+    overlay.hidden = false;
+    document.body?.classList.add('llm-floating-open');
+    await render();
+}
+
+function ensureFloatingLauncher() {
+    if (!document.body || document.getElementById('legacy-life-manager-floating')) return;
+    const launcher = el('button', 'llm-floating-launcher', '历');
+    launcher.id = 'legacy-life-manager-floating';
+    launcher.type = 'button';
+    launcher.title = '打开历代人生管理器';
+    launcher.setAttribute('aria-label', '打开历代人生管理器');
+    launcher.addEventListener('click', () => openFloatingPanel().catch(error => notify('error', error.message || '无法打开浮动面板')));
+
+    const overlay = el('div', 'llm-floating-overlay');
+    overlay.id = 'legacy-life-manager-floating-overlay';
+    overlay.hidden = true;
+    const shell = el('section', 'llm-floating-shell');
+    shell.setAttribute('role', 'dialog');
+    shell.setAttribute('aria-modal', 'true');
+    shell.setAttribute('aria-label', '历代人生管理器');
+    const topbar = el('div', 'llm-floating-topbar');
+    topbar.append(
+        el('span', '', '正文快速查看'),
+        createButton('×', closeFloatingPanel, 'llm-floating-close'),
+    );
+    const host = el('div', 'llm-floating-panel-host');
+    shell.append(topbar, host);
+    overlay.append(shell);
+    overlay.addEventListener('click', event => { if (event.target === overlay) closeFloatingPanel(); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape' && !overlay.hidden) closeFloatingPanel(); });
+    document.body.append(launcher, overlay);
 }
 
 function activateTab(id) {
@@ -1039,6 +1133,7 @@ export async function init() {
     initialized = true;
     settings();
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
+    ensureFloatingLauncher();
     registerEvents();
     await render();
     await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
@@ -1048,7 +1143,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.8.0 已加载');
+    console.log('[历代人生管理器] v0.9.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

@@ -544,6 +544,22 @@ export function carrierCardSections(card) {
     return sections;
 }
 
+/**
+ * Reads the confirmed carrier's life story as a first-class dossier field.
+ * New cards use the “人生背景” section, while aliases keep older or
+ * hand-edited cards compatible.
+ */
+export function carrierBackgroundStory(card) {
+    const sections = carrierCardSections(card);
+    const section = sections.find(item => /^(?:人生背景|背景故事|生平经历|成长经历)$/.test(String(item?.title || '').trim()));
+    if (section?.content) return section.content.trim();
+    for (const label of ['人生背景', '背景故事', '原主关键人生', '生平经历', '成长经历']) {
+        const value = carrierField(card, label);
+        if (value) return value;
+    }
+    return '';
+}
+
 export function isCarrierConfirmation(value) {
     const text = String(value || '').trim();
     return text === '确认换身';

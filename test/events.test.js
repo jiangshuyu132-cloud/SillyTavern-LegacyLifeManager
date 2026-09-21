@@ -59,6 +59,15 @@ test('严格主档案每轮发送完整人物卡并保留正文变量模块',()=
  assert.match(prompt.prompt,/物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场/);
  assert.match(prompt.prompt,/【当前载体人物设定开始】/);
 });
+test('人生背景作为独立当前身体资料实际进入每轮AI上下文',()=>{
+ const after=setup();ctx.chat.push({is_user:true,mes:'继续生活'});
+ const backgroundCard='【当前载体人物设定开始】\n— 当前形态基础 —\n<b>姓名：</b>新身体<br>\n— 人生背景 —\n<b>出生与家庭：</b>出生在北境矿村。<br>\n<b>成长经历：</b>十二岁进入工坊，二十岁成为独立铁匠。<br>\n— 外貌详述 —\n黑发。\n【当前载体人物设定结束】';
+ const body={profile:{姓名:'新身体'},rawCard:backgroundCard,text:backgroundCard};
+ const prompt=plugin.buildCurrentBodyPrompt(body,after,'strict').prompt;
+ assert.match(prompt,/当前身体人生背景｜出生至接管年龄｜每轮有效/);
+ assert.match(prompt,/十二岁进入工坊，二十岁成为独立铁匠/);
+ assert.match(prompt,/不得把它误当成前世经历/);
+});
 test('生成前把正文最新身体变化实际写入AI上下文，未确认身份补丁不能偷换身体',async()=>{
  setup();plugin.reconcileConversation();ctx.chat.push(
   {is_user:true,mes:'检查衣服和伤口'},

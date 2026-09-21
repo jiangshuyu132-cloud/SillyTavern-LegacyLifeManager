@@ -384,6 +384,43 @@
     line-height: 1.55;
 }
 
+.llm-background-story { border-color: rgb(214 186 120 / 28%) !important; background: linear-gradient(145deg, rgb(42 34 24 / 32%), rgb(14 17 24 / 78%)) !important; }
+.llm-background-content { padding: 0 1rem 1rem; color: #d3c7b0; line-height: 1.75; overflow-wrap: anywhere; white-space: pre-wrap; }
+.llm-background-empty { padding: 0.75rem 0.9rem; border: 1px dashed rgb(214 186 120 / 25%); border-radius: 11px; color: var(--llm-muted-color); font-size: 0.8rem; line-height: 1.55; }
+
+.llm-floating-launcher {
+    position: fixed;
+    z-index: 30000;
+    right: max(18px, env(safe-area-inset-right));
+    bottom: max(110px, calc(env(safe-area-inset-bottom) + 76px));
+    display: grid;
+    width: 52px;
+    height: 52px;
+    padding: 0;
+    place-items: center;
+    border: 1px solid rgb(186 166 255 / 78%);
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #b69cff, #7253dc 48%, #27203f 100%);
+    color: #fff;
+    font-family: serif;
+    font-size: 1.05rem;
+    font-weight: 700;
+    box-shadow: 0 8px 28px rgb(71 48 151 / 48%), inset 0 1px rgb(255 255 255 / 28%);
+    cursor: pointer;
+}
+
+.llm-floating-launcher::after { position: absolute; inset: -5px; border: 1px solid rgb(218 200 255 / 28%); border-radius: 50%; content: ''; }
+.llm-floating-launcher:hover { transform: translateY(-2px); filter: brightness(1.08); }
+.llm-floating-overlay { position: fixed; z-index: 30010; inset: 0; display: grid; padding: 3vh 3vw; place-items: center; background: rgb(3 5 9 / 72%); backdrop-filter: blur(5px); }
+.llm-floating-overlay[hidden] { display: none !important; }
+.llm-floating-shell { display: grid; width: min(980px, 94vw); max-height: 94vh; overflow: hidden; grid-template-rows: auto minmax(0, 1fr); border: 1px solid rgb(164 174 204 / 32%); border-radius: 18px; background: #0d1017; box-shadow: 0 24px 80px rgb(0 0 0 / 62%); }
+.llm-floating-topbar { display: flex; min-height: 46px; padding: 0.45rem 0.55rem 0.45rem 1rem; align-items: center; justify-content: space-between; border-bottom: 1px solid rgb(158 166 190 / 18%); color: #c8cad5; font-size: 0.82rem; letter-spacing: 0.08em; }
+.llm-floating-close { display: grid; width: 34px; height: 34px; padding: 0; place-items: center; border: 0; border-radius: 50%; background: rgb(255 255 255 / 6%); color: #d9dbe4; font-size: 1.25rem; cursor: pointer; }
+.llm-floating-panel-host { min-height: 0; overflow: auto; }
+.llm-floating-panel-host #legacy-life-manager-root .inline-drawer { border: 0; border-radius: 0; }
+.llm-floating-open #legacy-life-manager-root .inline-drawer-content { display: block !important; }
+.llm-floating-open #legacy-life-manager-root .inline-drawer-icon { display: none; }
+
 .llm-runtime-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
 .llm-runtime-card {
     position: relative;
@@ -478,6 +515,9 @@
     .llm-summary-grid { grid-template-columns: 1fr; }
     .llm-runtime-list { grid-template-columns: 1fr; }
     .llm-actions > button { flex: 1 1 100%; }
+    .llm-floating-launcher { right: 14px; bottom: max(92px, calc(env(safe-area-inset-bottom) + 68px)); width: 46px; height: 46px; }
+    .llm-floating-overlay { padding: 1.5vh 2vw; }
+    .llm-floating-shell { width: 96vw; max-height: 97vh; }
 }
 
 @media (prefers-reduced-motion: reduce) {
