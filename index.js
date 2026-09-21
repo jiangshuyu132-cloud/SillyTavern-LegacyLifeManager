@@ -20,12 +20,14 @@ import {
     extractCarrierCards,
     getPath,
     inferredLivesFromCarrierCard,
+    isSafeRuntimePatch,
     lifeHistorySummaries,
     liveBodyState,
     mergeLifeRecords,
     normalizedMoney,
     normalizeEntries,
     parseCarrierCard,
+    replayDynamicStatData,
     rebuildConversationLives,
     safeFilename,
     stableTextFingerprint,
@@ -45,7 +47,7 @@ let moneyInheritanceInFlight = false;
 let refreshTimers = [];
 let lastNotification = { key: '', at: 0 };
 let lastPromptText = '';
-let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'strict', effectiveMode: '等待当前身体' };
+let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'strict', effectiveMode: '等待当前身体', injected: false, sourceFloor: 0, appliedOperations: 0 };
 
 function context() {
     return globalThis.SillyTavern?.getContext?.();
@@ -142,10 +144,28 @@ function protocolMessages() {
 
 function readEffectiveStatData() {
     const messages = protocolMessages();
-    // Only persisted snapshots may drive current-body injection; text patches are not proof.
-    // Confirmation/archiving still require the separate verified transaction chain.
-    const statData=protocolTimeline(messages,{storedOnly:true}).at(-1) || {};
-    return {statData:Object.keys(statData).length ? statData : readStatData(), appliedOperations:0, lastMessageIndex:messages.length-1};
+    // Persisted snapshots remain the only proof for identity and lifecycle.
+    // Runtime-only patches after the newest snapshot may update this turn's
+    // injuries, clothing, status and other ordinary state, but cannot switch
+    // the current body or alter the confirmation protocol.
+    const timeline = protocolTimeline(messages, { storedOnly: true });
+    let storedMessageIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messageStat(messages[index])) {
+            storedMessageIndex = index;
+            break;
+        }
+    }
+    const stored = timeline.at(-1) || readStatData() || {};
+    const replayed = replayDynamicStatData(stored, messages, {
+        startIndex: storedMessageIndex + 1,
+        allowOperation: isSafeRuntimePatch,
+    });
+    return {
+        ...replayed,
+        storedMessageIndex,
+        sourceMessageIndex: replayed.lastMessageIndex >= 0 ? replayed.lastMessageIndex : storedMessageIndex,
+    };
 }
 
 function mergeLives(data, incoming) {
@@ -383,16 +403,15 @@ function buildCurrentBodyPrompt(body, statData, mode) {
 - 对世界时间、当前地点、生命/法力/体力、等级属性、金钱、物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场、好感度、当前想法，以及正文中新发生并已写入变量的获得、消耗、损坏、治愈、移除、恶化等动态事实，以最新 stat_data 为准。
 - 状态效果必须合并：stat_data 决定当前是否存在、层数、剩余时间与即时严重度；插件档案提供完整症状、身体表现、长期影响与叙事细节。简短状态条不得覆盖详细档案；变量明确治愈或移除后也不得因旧档案继续视为仍生效。正文新增而插件原卡没有的状态必须接受。
 - 技能与人物关系同样合并：当前可用技能、数值、在场、好感度和即时想法以变量为准；插件档案中的能力背景、使用习惯、长期关系、记忆与感情提供详细语义。若出现无法按上述类型解决的真实冲突，明确指出冲突，不得默默选择较短文本。`;
-    const prompt = `<legacy_life_current_body>\n这是现实Participant已经确认、由“历代人生管理器”保存的当前身体档案。它是当前有效人物设定，不是候选，也不是前世。历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性不得回流；地点、资源、伤势、状态、身体变化与穿着等易变信息，以“正文实时状态”优先。\n\n【行动—人格协调规则｜每轮强制执行】\n- Participant输入决定“做什么”及最终选择；只要客观上可能，当前身体性格与恐惧不得否决、取消、偷换或强制判定该行动失败。\n- 当前身体的性格、价值观、感情、喜恶、愿望、恐惧、习惯、认知边界与思维方式决定“如何理解和执行”：注意力、风险评估、计划习惯、犹豫或决心、非意志性生理反应、语气与动作节奏都应一致。胆小者可以执行勇敢行动，但可在不撤销行动的前提下体现恐惧、谨慎准备、迟疑或身体紧张。\n- Recorder只能为实现Participant已明确内容，补充最低限度且不改变意图的当下体验与执行质感；不得新增目标、选择、台词、后续主动行动或替Participant改变决定。当前人格造成的是可信阻力与代价，不是行动否决权。\n- 思考与感知必须使用当前身体的词汇、知识边界、价值排序、认知习惯和身体经验；除已归档的重要经历记忆外，不得泄露历代旧人格或旧知识。\n\n【当前人格与思维方式｜每轮有效】\n${behavior}\n\n【${detailTitle}】\n${details}\n\n【正文实时状态】\n${dynamicContextText(statData, mode === 'full')}${historySection}\n</legacy_life_current_body>`;
+    const prompt = `<legacy_life_current_body>\n这是现实Participant已经确认、由“历代人生管理器”保存并在本轮生成前重新合并的当前有效身体档案。它已经实际进入本轮 AI 上下文，不是只供插件界面显示的记录；也不是候选或前世。历代旧人格、旧感情、旧知识、旧语言、旧技能或旧属性不得回流；下方“当前有效动态覆盖”是截至本轮最新正文的执行值。\n\n【行动—人格协调规则｜每轮强制执行】\n- Participant输入决定“做什么”及最终选择；只要客观上可能，当前身体性格与恐惧不得否决、取消、偷换或强制判定该行动失败。\n- 当前身体的性格、价值观、感情、喜恶、愿望、恐惧、习惯、认知边界与思维方式决定“如何理解和执行”：注意力、风险评估、计划习惯、犹豫或决心、非意志性生理反应、语气与动作节奏都应一致。胆小者可以执行勇敢行动，但可在不撤销行动的前提下体现恐惧、谨慎准备、迟疑或身体紧张。\n- Recorder只能为实现Participant已明确内容，补充最低限度且不改变意图的当下体验与执行质感；不得新增目标、选择、台词、后续主动行动或替Participant改变决定。当前人格造成的是可信阻力与代价，不是行动否决权。\n- 思考与感知必须使用当前身体的词汇、知识边界、价值排序、认知习惯和身体经验；除已归档的重要经历记忆外，不得泄露历代旧人格或旧知识。\n\n【当前人格与思维方式｜每轮有效】\n${behavior}\n\n【${detailTitle}】\n${details}\n\n【当前有效动态覆盖｜本轮必须执行】\n以下内容已在生成前从最新 stat_data 及尚待 MVU 落盘的安全正文变量更新中重新计算。它不是历史备注：伤势、疾病是否仍生效、卫生、穿着、形态、改造、位置、资源和数值必须按这里的当前值续写；明确移除的状态不得从接管时原卡复活。\n${dynamicContextText(statData, mode === 'full')}${historySection}\n</legacy_life_current_body>`;
     const authoritativePrompt = prompt
         .replace('<legacy_life_current_body>', '<legacy_life_current_body authority="confirmed-plugin-dossier-first">')
-        .replace('；地点、资源、伤势、状态、身体变化与穿着等易变信息，以“正文实时状态”优先。', '。')
         .replace('\n\n【行动—人格协调规则', `\n\n${authorityRules}\n\n【行动—人格协调规则`);
     const guardedPrompt = authoritativePrompt.replace('\n\n【行动—人格协调规则', `\n\n${moneyRule}\n\n【行动—人格协调规则`);
     return { prompt: guardedPrompt, effectiveMode };
 }
 
-function recordPromptStats(prompt, requestedMode, effectiveMode) {
+function recordPromptStats(prompt, requestedMode, effectiveMode, runtimeInfo = {}, injected = true) {
     const characters = prompt.length;
     lastPromptStats = {
         characters,
@@ -400,6 +419,10 @@ function recordPromptStats(prompt, requestedMode, effectiveMode) {
         tokenHigh: characters,
         requestedMode,
         effectiveMode,
+        injected: Boolean(injected && prompt),
+        injectedAt: injected && prompt ? new Date().toISOString() : '',
+        sourceFloor: Number(runtimeInfo?.sourceMessageIndex ?? -1) + 1,
+        appliedOperations: Number(runtimeInfo?.appliedOperations || 0),
     };
     const meter = document.querySelector('#legacy-life-manager-root .llm-prompt-meter');
     if (meter) meter.textContent = promptStatsText();
@@ -407,19 +430,23 @@ function recordPromptStats(prompt, requestedMode, effectiveMode) {
 
 function promptStatsText() {
     const stats = lastPromptStats;
-    return `当前实际注入：${stats.effectiveMode} · ${stats.characters.toLocaleString()} 字符 · 约 ${stats.tokenLow.toLocaleString()}–${stats.tokenHigh.toLocaleString()} Token`;
+    const source = stats.sourceFloor > 0 ? ` · 正文截至第 ${stats.sourceFloor} 楼` : '';
+    const live = stats.appliedOperations ? ` · 含 ${stats.appliedOperations} 项待落盘变化` : '';
+    const state = stats.injected ? '已写入 AI 上下文' : '当前未注入';
+    return `${state}：${stats.effectiveMode} · ${stats.characters.toLocaleString()} 字符 · 约 ${stats.tokenLow.toLocaleString()}–${stats.tokenHigh.toLocaleString()} Token${source}${live}`;
 }
 
 async function updateCurrentBodyPrompt() {
     const ctx = context();
     if (typeof ctx?.setExtensionPrompt !== 'function') return;
     reconcileConversation({ reason: '生成前校验' });
-    const { statData } = readEffectiveStatData();
+    const runtimeInfo = readEffectiveStatData();
+    const { statData } = runtimeInfo;
     const requestedMode = settings().injectionMode || 'strict';
     const built = buildCurrentBodyPrompt(currentImportedBody(), statData, requestedMode);
     await ctx.setExtensionPrompt(PROMPT_KEY, built.prompt, 1, 0, false, 0);
     lastPromptText = built.prompt;
-    recordPromptStats(built.prompt, requestedMode, built.effectiveMode);
+    recordPromptStats(built.prompt, requestedMode, built.effectiveMode, runtimeInfo, true);
 }
 
 function currentWorldBookName() {
@@ -609,8 +636,8 @@ async function clearCurrentChatLedger() {
 
 function renderFullBody(panel, body) {
     if (!body?.text) return;
-    const heading = el('h3', 'llm-section-title', '接管时的完整身体档案');
-    const intro = el('div', 'llm-muted', '这里保留接管时的完整人物卡原文；伤势、变异、改造、形态和穿着等后续变化，以上方“正文实时身体状态”为准。');
+    const heading = el('h3', 'llm-section-title', '当前有效身体档案（每轮发送给 AI）');
+    const intro = el('div', 'llm-muted', '下列折叠项保留接管时的详细基础设定；上方“当前有效动态覆盖”会随正文更新并在同一轮提示中覆盖旧伤势、疾病状态、卫生、穿着、形态和改造。界面显示与 AI 实际接收使用同一份合并数据。');
     const sections = el('div', 'llm-sections');
     for (const section of body.sections || carrierCardSections(body.rawCard)) {
         const details = document.createElement('details');
@@ -639,7 +666,7 @@ function renderRuntimeBodyState(panel, statData, runtimeInfo = {}) {
     const carrier = asObject(main.载体档案);
     const effects = Object.entries(asObject(main.状态效果));
     const changes = [];
-    const wanted = /伤|病|健康|外貌|身体|体型|皮肤|四肢|器官|变异|改造|形态|植入|义体|血脉|特征|穿着/;
+    const wanted = /伤|病|健康|外貌|身体|体型|皮肤|四肢|器官|结构|生理|变异|改造|形态|植入|义体|血脉|特征|疤痕|气味|卫生|体毛|发色|瞳色|身高|体重|尺寸|标记|烙印|诅咒|祝福|穿着|衣着|足部|脚部/;
     for (const [key, value] of Object.entries(carrier)) {
         if (wanted.test(key) && runtimeValueText(value)) changes.push([key, value]);
     }
@@ -648,10 +675,11 @@ function renderRuntimeBodyState(panel, statData, runtimeInfo = {}) {
     }
     if (!effects.length && !changes.length && !runtimeInfo.appliedOperations) return;
 
-    panel.append(el('h3', 'llm-section-title', '正文实时身体状态'));
+    panel.append(el('h3', 'llm-section-title', '当前有效动态覆盖（已发送给 AI）'));
+    const sourceFloor = Number(runtimeInfo?.sourceMessageIndex ?? -1) + 1;
     const note = runtimeInfo.appliedOperations
-        ? `已从最新正文的变量更新中补全 ${runtimeInfo.appliedOperations} 项变化；当 MVU 楼层快照延迟或路径使用“最新动态”别名时仍会立即显示。`
-        : '伤势、状态、变异、改造、形态和穿着会随最新正文变量更新。';
+        ? `已读取到第 ${sourceFloor} 楼，并从最新正文变量更新中提前补全 ${runtimeInfo.appliedOperations} 项尚待 MVU 落盘的安全变化；这些内容已经加入本轮 AI 上下文。`
+        : `已读取到第 ${sourceFloor} 楼的最新变量快照；伤势、状态、变异、改造、形态、卫生和穿着会随正文更新并加入 AI 上下文。`;
     panel.append(el('div', 'llm-runtime-note', note));
     const list = el('div', 'llm-runtime-list');
     for (const [name, value] of effects) {
@@ -759,6 +787,9 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
     }
     panel.append(details);
     renderRuntimeBodyState(panel, statData, runtimeInfo);
+    const receipt = el('div', lastPromptStats.injected ? 'llm-injection-receipt' : 'llm-warning');
+    receipt.textContent = promptStatsText();
+    panel.append(receipt);
     renderFullBody(panel, importedBody);
 }
 
@@ -837,7 +868,7 @@ function renderSettings(panel) {
         updateCurrentBodyPrompt();
     });
     injectionLabel.append(injection);
-    const injectionHelp = el('div', 'llm-muted', '严格主档案模式每轮发送完整人物卡，并同时要求 AI 读取正文 stat_data 的物品、任务、关系、新闻等动态模块；重叠字段按“插件详细设定为主、实时变化合并”的规则处理。');
+    const injectionHelp = el('div', 'llm-muted', '严格主档案模式在每次生成前重新合并并发送完整人物卡与当前有效动态覆盖；正文 stat_data 的物品、任务、关系、新闻等模块仍会一起读取。身份必须经过确认链，伤势、卫生、穿着、形态等安全动态可紧跟最新正文。');
     const promptMeter = el('div', 'llm-prompt-meter', promptStatsText());
     const promptPreview = document.createElement('details');
     promptPreview.className = 'llm-prompt-preview';
@@ -982,8 +1013,8 @@ function scheduleRefresh(reason = '正文楼层变化') {
     refreshTimers.forEach(clearTimeout);
     refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(async () => {
         await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
+        await updateCurrentBodyPrompt().catch(error => console.error('[历代人生管理器] 注入失败', error));
         render().catch(error => console.error('[历代人生管理器] 渲染失败', error));
-        updateCurrentBodyPrompt().catch(error => console.error('[历代人生管理器] 注入失败', error));
         installCardButtons();
     }, delay));
 }
@@ -1011,13 +1042,13 @@ export async function init() {
     registerEvents();
     await render();
     await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
+    await updateCurrentBodyPrompt();
     await render();
     installCardButtons();
-    await updateCurrentBodyPrompt();
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.7.1 已加载');
+    console.log('[历代人生管理器] v0.8.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

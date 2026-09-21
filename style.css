@@ -374,6 +374,16 @@
     line-height: 1.55;
 }
 
+.llm-injection-receipt {
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(91, 226, 183, .28);
+    border-radius: 10px;
+    background: rgba(44, 165, 129, .10);
+    color: #aef2d5;
+    line-height: 1.55;
+}
+
 .llm-runtime-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
 .llm-runtime-card {
     position: relative;

@@ -24,6 +24,7 @@ import {
     getPath,
     initialPlayerProfile,
     inferredLivesFromCarrierCard,
+    isSafeRuntimePatch,
     isCarrierConfirmation,
     lifeHistorySummaries,
     lifeSummariesFromCarrierCard,
@@ -86,6 +87,27 @@ test('dynamic replay ignores unrelated roots, user messages and unsafe pointers'
     assert.equal(result.appliedOperations, 0);
     assert.equal(result.statData.主角.等级, 1);
     assert.equal({}.polluted, undefined);
+});
+
+test('runtime patch replay follows body changes without allowing an unconfirmed identity switch', () => {
+    const messages = [{ is_user: false, mes: `<UpdateVariable><JSONPatch>[
+      {"op":"replace","path":"/主角/载体档案/姓名","value":"候选身体"},
+      {"op":"replace","path":"/主角/种族","value":"候选种族"},
+      {"op":"replace","path":"/主角/换身状态/阶段","value":"当前身体生效"},
+      {"op":"add","path":"/主角/载体档案/当前穿着","value":"沾血的白袍"},
+      {"op":"insert","path":"/主角/状态效果/左臂割伤","value":{"描述":"仍在渗血"}},
+      {"op":"delta","path":"/主角/生命值/当前","value":-9}
+    ]</JSONPatch></UpdateVariable>` }];
+    const result = replayDynamicStatData({ 主角: { 载体档案: { 姓名: '已确认身体' }, 状态效果: {}, 生命值: { 当前: 100 } } }, messages, {
+        allowOperation: isSafeRuntimePatch,
+    });
+    assert.equal(result.statData.主角.载体档案.姓名, '已确认身体');
+    assert.equal(result.statData.主角.种族, undefined);
+    assert.equal(result.statData.主角.载体档案.当前穿着, '沾血的白袍');
+    assert.equal(result.statData.主角.状态效果.左臂割伤.描述, '仍在渗血');
+    assert.equal(result.statData.主角.生命值.当前, 91);
+    assert.equal(result.appliedOperations, 3);
+    assert.equal(result.ignoredOperations, 3);
 });
 
 test('smart injection uses the full card only before the first post-confirmation reply', () => {

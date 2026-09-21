@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
-let ctx,book,saveCount,fetchCount,readbackOK=true,changeDuringRead=false;
+let ctx,book,saveCount,fetchCount,readbackOK=true,changeDuringRead=false,injectedPrompt='';
 globalThis.document={readyState:'loading',addEventListener(){},getElementById(){return null;},querySelector(){return null;}};
 globalThis.SillyTavern={getContext:()=>ctx};
 globalThis.toastr={info(){},warning(){},error(){},success(){}};
@@ -9,15 +9,15 @@ globalThis.confirm=()=>true;
 globalThis.getVariables=opts=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;return {stat_data:ctx.chat[index]?.stat_data};};
 globalThis.updateVariablesWith=(fn,opts)=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;const next=fn({stat_data:ctx.chat[index].stat_data});ctx.chat[index].stat_data=next.stat_data;};
 globalThis.fetch=async()=>{fetchCount++;if(changeDuringRead)ctx.chatId='different-chat';return {ok:readbackOK,async json(){return structuredClone(book);}};};
-const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance};';
+const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance,updateCurrentBodyPrompt};';
 const plugin=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const card='【当前载体人物设定开始】\n<div><b>世代编号：</b>第2世<br><b>姓名：</b>新身体<br></div>\n【当前载体人物设定结束】';
 const draft='词条名称: 第1世·旧身体\n重要人物: 守卫\n重要经历：守住城门。';
 function setup(){
- saveCount=0;fetchCount=0;readbackOK=true;changeDuringRead=false;book={entries:{}};
+ saveCount=0;fetchCount=0;readbackOK=true;changeDuringRead=false;injectedPrompt='';book={entries:{}};
  const before={主角:{金钱:123456,载体档案:{姓名:'旧身体'},换身状态:{阶段:'等待确认',当前身体死亡已确认:true,当前世代编号:1,待确认人物卡:card,当前身体死亡信息:'已死亡',待归档人生词条:'',归档写入状态:'无待处理'}},历代记忆摘要:[]};
  const after={主角:{金钱:800,载体档案:{姓名:'新身体'},换身状态:{阶段:'当前身体生效',当前身体死亡已确认:false,当前世代编号:2,待确认人物卡:'',当前身体死亡信息:'',待归档人生词条:draft,归档写入状态:'待写入世界书'}},历代记忆摘要:[{世代编号:1,身体姓名:'旧身体',详细词条名称:'第1世·旧身体'}]};
- ctx={chatId:'test',chat:[{is_user:false,mes:card,stat_data:before},{is_user:true,mes:'确认换身'},{is_user:false,mes:'交接正文',stat_data:after}],chatMetadata:{world_info:'现有测试世界书'},extensionSettings:{},getWorldInfoNames:()=>['现有测试世界书'],getRequestHeaders:()=>({'Content-Type':'application/json'}),async loadWorldInfo(){return structuredClone(book);},async saveWorldInfo(_name,data){saveCount++;book=structuredClone(data);},saveMetadataDebounced(){},saveSettingsDebounced(){}};return after;
+ ctx={chatId:'test',chat:[{is_user:false,mes:card,stat_data:before},{is_user:true,mes:'确认换身'},{is_user:false,mes:'交接正文',stat_data:after}],chatMetadata:{world_info:'现有测试世界书'},extensionSettings:{},getWorldInfoNames:()=>['现有测试世界书'],getRequestHeaders:()=>({'Content-Type':'application/json'}),async loadWorldInfo(){return structuredClone(book);},async saveWorldInfo(_name,data){saveCount++;book=structuredClone(data);},async setExtensionPrompt(_key,value){injectedPrompt=value;},saveMetadataDebounced(){},saveSettingsDebounced(){}};return after;
 }
 test('真实归档回调写入、后端回读后清理，重复点击不增词条',async()=>{
  setup();await plugin.archivePendingLife();assert.equal(saveCount,1);assert.equal(fetchCount,1);assert.equal(Object.keys(book.entries).length,1);assert.equal(ctx.chat[2].stat_data.主角.换身状态.待归档人生词条,'');await assert.rejects(plugin.archivePendingLife(),/有效待归档/);assert.equal(saveCount,1);
@@ -58,6 +58,27 @@ test('严格主档案每轮发送完整人物卡并保留正文变量模块',()=
  assert.match(prompt.prompt,/必须同时读取本插件档案与正文已有的 <status_current_variables>\/stat_data/);
  assert.match(prompt.prompt,/物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场/);
  assert.match(prompt.prompt,/【当前载体人物设定开始】/);
+});
+test('生成前把正文最新身体变化实际写入AI上下文，未确认身份补丁不能偷换身体',async()=>{
+ setup();plugin.reconcileConversation();ctx.chat.push(
+  {is_user:true,mes:'检查衣服和伤口'},
+  {is_user:false,mes:`正文<UpdateVariable><JSONPatch>${JSON.stringify([
+   {op:'replace',path:'/主角/载体档案/姓名',value:'候选身体'},
+   {op:'replace',path:'/主角/种族',value:'候选种族'},
+   {op:'add',path:'/主角/载体档案/当前穿着',value:'沾血的白袍'},
+   {op:'add',path:'/主角/状态效果/左臂割伤',value:{描述:'仍在渗血',持续:'未处理'}}
+  ])}</JSONPatch></UpdateVariable>`}
+ );
+ const effective=plugin.readEffectiveStatData();
+ assert.equal(effective.statData.主角.载体档案.姓名,'新身体');
+ assert.equal(effective.statData.主角.种族,undefined);
+ assert.equal(effective.statData.主角.载体档案.当前穿着,'沾血的白袍');
+ assert.equal(effective.appliedOperations,2);
+ await plugin.updateCurrentBodyPrompt();
+ assert.match(injectedPrompt,/当前有效动态覆盖｜本轮必须执行/);
+ assert.match(injectedPrompt,/沾血的白袍/);
+ assert.match(injectedPrompt,/左臂割伤/);
+ assert.doesNotMatch(injectedPrompt,/候选身体/);
 });
 test('刷新时用可信备份恢复缺少提交层快照的有效换身，删除确认层仍撤销',()=>{
  const after=setup();plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;

@@ -59,6 +59,15 @@ export function extractJsonPatchOperations(value) {
     return operations;
 }
 
+function extractRuntimeUpdateOperations(value) {
+    const source = String(value || '').replace(/```[\s\S]*?```/g, '');
+    const operations = [];
+    for (const block of source.matchAll(/<UpdateVariable\b[^>]*>([\s\S]*?)<\/UpdateVariable>/gi)) {
+        operations.push(...extractJsonPatchOperations(block[1]));
+    }
+    return operations;
+}
+
 function jsonPointerParts(path) {
     const source = String(path || '').trim();
     if (!source.startsWith('/')) return [];
@@ -72,25 +81,33 @@ function jsonPointerParts(path) {
 
 function applyJsonPointerOperation(root, operation) {
     const parts = jsonPointerParts(operation?.path);
-    if (!parts.length || !['add', 'replace', 'remove'].includes(operation?.op)) return false;
+    if (!parts.length || !['add', 'insert', 'replace', 'remove', 'delta'].includes(operation?.op)) return false;
     let parent = root;
     for (let index = 0; index < parts.length - 1; index += 1) {
         const part = parts[index];
         const nextIsArray = parts[index + 1] === '-' || /^\d+$/.test(parts[index + 1]);
-        if (!parent[part] || typeof parent[part] !== 'object') parent[part] = nextIsArray ? [] : {};
+        if (!parent[part] || typeof parent[part] !== 'object') {
+            if (!['add', 'insert', 'replace'].includes(operation.op)) return false;
+            parent[part] = nextIsArray ? [] : {};
+        }
         parent = parent[part];
     }
     const key = parts.at(-1);
     if (Array.isArray(parent)) {
         const index = key === '-' ? parent.length : Number(key);
         if (!Number.isInteger(index) || index < 0) return false;
+        if (operation.op === 'delta') {
+            if (!Number.isFinite(operation.value) || !Number.isFinite(parent[index])) return false;
+            parent[index] += operation.value;
+            return true;
+        }
         if (operation.op === 'remove') {
             if (index >= parent.length) return false;
             parent.splice(index, 1);
-        } else if (operation.op === 'add' && index < parent.length) {
+        } else if (['add', 'insert'].includes(operation.op) && index < parent.length) {
             if (JSON.stringify(parent[index]) === JSON.stringify(operation.value)) return false;
             parent.splice(index, 0, clone(operation.value));
-        } else if (operation.op === 'add' && key === '-' && parent.some(item => JSON.stringify(item) === JSON.stringify(operation.value))) {
+        } else if (['add', 'insert'].includes(operation.op) && key === '-' && parent.some(item => JSON.stringify(item) === JSON.stringify(operation.value))) {
             // The base snapshot may already contain this append. Keep replay idempotent.
             return false;
         } else {
@@ -100,6 +117,11 @@ function applyJsonPointerOperation(root, operation) {
         return true;
     }
     if (!parent || typeof parent !== 'object') return false;
+    if (operation.op === 'delta') {
+        if (!Number.isFinite(operation.value) || !Number.isFinite(parent[key])) return false;
+        parent[key] += operation.value;
+        return true;
+    }
     if (operation.op === 'remove') {
         if (!Object.hasOwn(parent, key)) return false;
         delete parent[key];
@@ -118,19 +140,47 @@ function applyJsonPointerOperation(root, operation) {
 export function replayDynamicStatData(statData = {}, messages = [], options = {}) {
     const result = clone(asObject(statData));
     const startIndex = Math.max(0, Number(options?.startIndex || 0));
+    const allowOperation = typeof options?.allowOperation === 'function' ? options.allowOperation : () => true;
     let appliedOperations = 0;
+    let ignoredOperations = 0;
     let lastMessageIndex = -1;
     for (let index = startIndex; index < messages.length; index += 1) {
         const message = messages[index];
-        if (!message || message.is_user || message.is_system) continue;
-        for (const operation of extractJsonPatchOperations(message.mes)) {
+        if (!message || message.is_user || message.is_system || isDiscussion(message)) continue;
+        for (const operation of extractRuntimeUpdateOperations(message.mes)) {
+            if (!allowOperation(operation)) {
+                ignoredOperations += 1;
+                continue;
+            }
             if (applyJsonPointerOperation(result, operation)) {
                 appliedOperations += 1;
                 lastMessageIndex = index;
             }
         }
     }
-    return { statData: result, appliedOperations, lastMessageIndex };
+    return { statData: result, appliedOperations, ignoredOperations, lastMessageIndex };
+}
+
+/**
+ * Text JSONPatch output may temporarily be newer than MVU's stored snapshot.
+ * It may improve the current turn's runtime view, but it must never be allowed
+ * to prove or replace an identity. Identity and lifecycle changes continue to
+ * require the persisted confirmation transaction.
+ */
+export function isSafeRuntimePatch(operation = {}) {
+    const parts = jsonPointerParts(operation?.path);
+    if (!parts.length) return false;
+    if (parts[0] === '世界') return true;
+    if (parts[0] !== '主角') return false;
+    if (parts[1] === '换身状态') return false;
+    if (parts.length === 1) return false;
+    const identityFields = new Set(['姓名', '原主姓名', '世代编号', '年龄', '性别', '种族', '身份', '职业', '身份职业', '社会地位', '生命层级']);
+    if (identityFields.has(parts[1])) return false;
+    if (parts[1] === '载体档案') {
+        if (parts.length < 3) return false;
+        if (identityFields.has(parts[2])) return false;
+    }
+    return true;
 }
 
 const BODY_CHANGE_FIELD = /伤|病|健康|外貌|身体|体型|皮肤|四肢|器官|结构|生理|变异|改造|形态|植入|义体|血脉|特征|疤痕|气味|卫生|体毛|发色|瞳色|身高|体重|尺寸|标记|烙印|诅咒|祝福|穿着/;
