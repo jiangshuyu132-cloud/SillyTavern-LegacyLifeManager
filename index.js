@@ -1013,8 +1013,112 @@ async function openFloatingPanel() {
     await render();
 }
 
+function ensureFloatingRuntimeStyles() {
+    if (document.getElementById('legacy-life-manager-floating-runtime-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'legacy-life-manager-floating-runtime-styles';
+    style.textContent = `
+        #legacy-life-manager-floating.llm-floating-launcher {
+            position: fixed !important;
+            z-index: 2147483000 !important;
+            right: max(18px, env(safe-area-inset-right)) !important;
+            bottom: max(110px, calc(env(safe-area-inset-bottom) + 76px)) !important;
+            display: grid !important;
+            width: 52px !important;
+            height: 52px !important;
+            min-width: 52px !important;
+            min-height: 52px !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            place-items: center !important;
+            border: 1px solid rgb(186 166 255 / 78%) !important;
+            border-radius: 50% !important;
+            background: radial-gradient(circle at 35% 30%, #b69cff, #7253dc 48%, #27203f 100%) !important;
+            color: #fff !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            font-family: serif !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
+            line-height: 1 !important;
+            box-shadow: 0 8px 28px rgb(71 48 151 / 48%), inset 0 1px rgb(255 255 255 / 28%) !important;
+            cursor: pointer !important;
+            transform: none !important;
+        }
+        #legacy-life-manager-floating.llm-floating-launcher::after {
+            position: absolute;
+            inset: -5px;
+            border: 1px solid rgb(218 200 255 / 28%);
+            border-radius: 50%;
+            content: '';
+            pointer-events: none;
+        }
+        #legacy-life-manager-floating-overlay.llm-floating-overlay {
+            position: fixed !important;
+            z-index: 2147483001 !important;
+            inset: 0 !important;
+            display: grid !important;
+            padding: 3vh 3vw !important;
+            place-items: center !important;
+            background: rgb(3 5 9 / 72%) !important;
+            backdrop-filter: blur(5px);
+        }
+        #legacy-life-manager-floating-overlay[hidden] { display: none !important; }
+        #legacy-life-manager-floating-overlay .llm-floating-shell {
+            display: grid !important;
+            width: min(980px, 94vw) !important;
+            max-height: 94vh !important;
+            overflow: hidden !important;
+            grid-template-rows: auto minmax(0, 1fr) !important;
+            border: 1px solid rgb(164 174 204 / 32%) !important;
+            border-radius: 18px !important;
+            background: #0d1017 !important;
+            box-shadow: 0 24px 80px rgb(0 0 0 / 62%) !important;
+        }
+        #legacy-life-manager-floating-overlay .llm-floating-topbar {
+            display: flex !important;
+            min-height: 46px !important;
+            padding: .45rem .55rem .45rem 1rem !important;
+            align-items: center !important;
+            justify-content: space-between !important;
+            border-bottom: 1px solid rgb(158 166 190 / 18%) !important;
+            color: #c8cad5 !important;
+        }
+        #legacy-life-manager-floating-overlay .llm-floating-close {
+            display: grid !important;
+            width: 34px !important;
+            height: 34px !important;
+            padding: 0 !important;
+            place-items: center !important;
+            border: 0 !important;
+            border-radius: 50% !important;
+            background: rgb(255 255 255 / 6%) !important;
+            color: #d9dbe4 !important;
+            font-size: 1.25rem !important;
+            cursor: pointer !important;
+        }
+        #legacy-life-manager-floating-overlay .llm-floating-panel-host { min-height: 0 !important; overflow: auto !important; }
+        body.llm-floating-open #legacy-life-manager-root .inline-drawer-content { display: block !important; }
+        body.llm-floating-open #legacy-life-manager-root .inline-drawer-icon { display: none !important; }
+        @media (max-width: 720px) {
+            #legacy-life-manager-floating.llm-floating-launcher {
+                right: 14px !important;
+                bottom: max(92px, calc(env(safe-area-inset-bottom) + 68px)) !important;
+                width: 46px !important;
+                height: 46px !important;
+                min-width: 46px !important;
+                min-height: 46px !important;
+            }
+            #legacy-life-manager-floating-overlay.llm-floating-overlay { padding: 1.5vh 2vw !important; }
+            #legacy-life-manager-floating-overlay .llm-floating-shell { width: 96vw !important; max-height: 97vh !important; }
+        }
+    `;
+    (document.head || document.documentElement).append(style);
+}
+
 function ensureFloatingLauncher() {
     if (!document.body || document.getElementById('legacy-life-manager-floating')) return;
+    ensureFloatingRuntimeStyles();
     const launcher = el('button', 'llm-floating-launcher', '历');
     launcher.id = 'legacy-life-manager-floating';
     launcher.type = 'button';
@@ -1143,7 +1247,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.9.0 已加载');
+    console.log('[历代人生管理器] v0.9.1 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

@@ -19,6 +19,12 @@ function setup(){
  const after={主角:{金钱:800,载体档案:{姓名:'新身体'},换身状态:{阶段:'当前身体生效',当前身体死亡已确认:false,当前世代编号:2,待确认人物卡:'',当前身体死亡信息:'',待归档人生词条:draft,归档写入状态:'待写入世界书'}},历代记忆摘要:[{世代编号:1,身体姓名:'旧身体',详细词条名称:'第1世·旧身体'}]};
  ctx={chatId:'test',chat:[{is_user:false,mes:card,stat_data:before},{is_user:true,mes:'确认换身'},{is_user:false,mes:'交接正文',stat_data:after}],chatMetadata:{world_info:'现有测试世界书'},extensionSettings:{},getWorldInfoNames:()=>['现有测试世界书'],getRequestHeaders:()=>({'Content-Type':'application/json'}),async loadWorldInfo(){return structuredClone(book);},async saveWorldInfo(_name,data){saveCount++;book=structuredClone(data);},async setExtensionPrompt(_key,value){injectedPrompt=value;},saveMetadataDebounced(){},saveSettingsDebounced(){}};return after;
 }
+test('浮动入口带有脚本内关键样式，旧 CSS 缓存也不会把按钮留在页面末端',()=>{
+ assert.match(source,/legacy-life-manager-floating-runtime-styles/);
+ assert.match(source,/#legacy-life-manager-floating\.llm-floating-launcher/);
+ assert.match(source,/position: fixed !important/);
+ assert.match(source,/z-index: 2147483000 !important/);
+});
 test('真实归档回调写入、后端回读后清理，重复点击不增词条',async()=>{
  setup();await plugin.archivePendingLife();assert.equal(saveCount,1);assert.equal(fetchCount,1);assert.equal(Object.keys(book.entries).length,1);assert.equal(ctx.chat[2].stat_data.主角.换身状态.待归档人生词条,'');await assert.rejects(plugin.archivePendingLife(),/有效待归档/);assert.equal(saveCount,1);
  const result=plugin.reconcileConversation();assert.equal(result.current.profile.姓名,'新身体');
