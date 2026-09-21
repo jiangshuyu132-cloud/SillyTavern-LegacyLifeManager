@@ -670,11 +670,16 @@ function renderFullBody(panel, body) {
 function renderBackgroundStory(panel, body) {
     if (!body) return;
     const story = String(body.backgroundStory || carrierBackgroundStory(body.rawCard || body.text) || '').trim();
+    panel.append(el('h3', 'llm-section-title', '当前身体人生背景（每轮发送给 AI）'));
     if (!story) {
-        panel.append(el('div', 'llm-background-empty', '这具身体来自旧版人物卡，尚未包含“出生至当前年龄”的独立人生背景。下一次生成新身体时会自动加入。'));
+        const empty = el('section', 'llm-background-empty');
+        empty.append(
+            el('strong', '', '本人物卡未提供人生背景'),
+            el('div', '', '当前这具身体的原始人物卡中没有“人生背景/背景故事/生平经历”板块，因此插件不能凭空补写。导入新版世界书后，新生成的下一具身体会包含从出生到接管年龄的完整背景，并在每轮发送给 AI。'),
+        );
+        panel.append(empty);
         return;
     }
-    panel.append(el('h3', 'llm-section-title', '当前身体人生背景（每轮发送给 AI）'));
     const details = document.createElement('details');
     details.className = 'llm-background-story';
     details.append(
@@ -1014,15 +1019,19 @@ async function openFloatingPanel() {
 }
 
 function ensureFloatingRuntimeStyles() {
-    if (document.getElementById('legacy-life-manager-floating-runtime-styles')) return;
-    const style = document.createElement('style');
-    style.id = 'legacy-life-manager-floating-runtime-styles';
+    let style = document.getElementById('legacy-life-manager-floating-runtime-styles');
+    if (!style) {
+        style = document.createElement('style');
+        style.id = 'legacy-life-manager-floating-runtime-styles';
+        (document.head || document.documentElement).append(style);
+    }
     style.textContent = `
         #legacy-life-manager-floating.llm-floating-launcher {
             position: fixed !important;
             z-index: 2147483000 !important;
             right: max(18px, env(safe-area-inset-right)) !important;
-            bottom: max(110px, calc(env(safe-area-inset-bottom) + 76px)) !important;
+            top: 50% !important;
+            bottom: auto !important;
             display: grid !important;
             width: 52px !important;
             height: 52px !important;
@@ -1043,7 +1052,7 @@ function ensureFloatingRuntimeStyles() {
             line-height: 1 !important;
             box-shadow: 0 8px 28px rgb(71 48 151 / 48%), inset 0 1px rgb(255 255 255 / 28%) !important;
             cursor: pointer !important;
-            transform: none !important;
+            transform: translateY(-50%) !important;
         }
         #legacy-life-manager-floating.llm-floating-launcher::after {
             position: absolute;
@@ -1103,7 +1112,8 @@ function ensureFloatingRuntimeStyles() {
         @media (max-width: 720px) {
             #legacy-life-manager-floating.llm-floating-launcher {
                 right: 14px !important;
-                bottom: max(92px, calc(env(safe-area-inset-bottom) + 68px)) !important;
+                top: 55% !important;
+                bottom: auto !important;
                 width: 46px !important;
                 height: 46px !important;
                 min-width: 46px !important;
@@ -1113,17 +1123,48 @@ function ensureFloatingRuntimeStyles() {
             #legacy-life-manager-floating-overlay .llm-floating-shell { width: 96vw !important; max-height: 97vh !important; }
         }
     `;
-    (document.head || document.documentElement).append(style);
+}
+
+function forceFloatingLauncherVisible(launcher) {
+    const important = {
+        position: 'fixed',
+        'z-index': '2147483000',
+        right: 'max(18px, env(safe-area-inset-right))',
+        top: '50%',
+        bottom: 'auto',
+        display: 'grid',
+        width: '52px',
+        height: '52px',
+        'min-width': '52px',
+        'min-height': '52px',
+        margin: '0',
+        padding: '0',
+        'place-items': 'center',
+        opacity: '1',
+        visibility: 'visible',
+        transform: 'translateY(-50%)',
+    };
+    for (const [name, value] of Object.entries(important)) launcher.style.setProperty(name, value, 'important');
 }
 
 function ensureFloatingLauncher() {
-    if (!document.body || document.getElementById('legacy-life-manager-floating')) return;
+    if (!document.body) return;
     ensureFloatingRuntimeStyles();
+    const existingLauncher = document.getElementById('legacy-life-manager-floating');
+    if (existingLauncher) {
+        existingLauncher.classList.add('llm-floating-launcher');
+        existingLauncher.textContent = '历';
+        existingLauncher.title = '打开历代人生管理器';
+        existingLauncher.setAttribute('aria-label', '打开历代人生管理器');
+        forceFloatingLauncherVisible(existingLauncher);
+        return;
+    }
     const launcher = el('button', 'llm-floating-launcher', '历');
     launcher.id = 'legacy-life-manager-floating';
     launcher.type = 'button';
     launcher.title = '打开历代人生管理器';
     launcher.setAttribute('aria-label', '打开历代人生管理器');
+    forceFloatingLauncherVisible(launcher);
     launcher.addEventListener('click', () => openFloatingPanel().catch(error => notify('error', error.message || '无法打开浮动面板')));
 
     const overlay = el('div', 'llm-floating-overlay');
@@ -1247,7 +1288,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.9.1 已加载');
+    console.log('[历代人生管理器] v0.9.2 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

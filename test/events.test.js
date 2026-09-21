@@ -24,6 +24,8 @@ test('浮动入口带有脚本内关键样式，旧 CSS 缓存也不会把按钮
  assert.match(source,/#legacy-life-manager-floating\.llm-floating-launcher/);
  assert.match(source,/position: fixed !important/);
  assert.match(source,/z-index: 2147483000 !important/);
+ assert.match(source,/forceFloatingLauncherVisible\(existingLauncher\)/);
+ assert.ok(source.indexOf('ensureFloatingRuntimeStyles();') < source.indexOf("const existingLauncher = document.getElementById('legacy-life-manager-floating')"));
 });
 test('真实归档回调写入、后端回读后清理，重复点击不增词条',async()=>{
  setup();await plugin.archivePendingLife();assert.equal(saveCount,1);assert.equal(fetchCount,1);assert.equal(Object.keys(book.entries).length,1);assert.equal(ctx.chat[2].stat_data.主角.换身状态.待归档人生词条,'');await assert.rejects(plugin.archivePendingLife(),/有效待归档/);assert.equal(saveCount,1);
@@ -73,6 +75,7 @@ test('人生背景作为独立当前身体资料实际进入每轮AI上下文',(
  assert.match(prompt,/当前身体人生背景｜出生至接管年龄｜每轮有效/);
  assert.match(prompt,/十二岁进入工坊，二十岁成为独立铁匠/);
  assert.match(prompt,/不得把它误当成前世经历/);
+ assert.match(source,/本人物卡未提供人生背景/);
 });
 test('生成前把正文最新身体变化实际写入AI上下文，未确认身份补丁不能偷换身体',async()=>{
  setup();plugin.reconcileConversation();ctx.chat.push(

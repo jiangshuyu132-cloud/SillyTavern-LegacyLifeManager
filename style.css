@@ -392,7 +392,8 @@
     position: fixed;
     z-index: 30000;
     right: max(18px, env(safe-area-inset-right));
-    bottom: max(110px, calc(env(safe-area-inset-bottom) + 76px));
+    top: 50%;
+    bottom: auto;
     display: grid;
     width: 52px;
     height: 52px;
@@ -407,6 +408,7 @@
     font-weight: 700;
     box-shadow: 0 8px 28px rgb(71 48 151 / 48%), inset 0 1px rgb(255 255 255 / 28%);
     cursor: pointer;
+    transform: translateY(-50%);
 }
 
 .llm-floating-launcher::after { position: absolute; inset: -5px; border: 1px solid rgb(218 200 255 / 28%); border-radius: 50%; content: ''; }
@@ -515,7 +517,7 @@
     .llm-summary-grid { grid-template-columns: 1fr; }
     .llm-runtime-list { grid-template-columns: 1fr; }
     .llm-actions > button { flex: 1 1 100%; }
-    .llm-floating-launcher { right: 14px; bottom: max(92px, calc(env(safe-area-inset-bottom) + 68px)); width: 46px; height: 46px; }
+    .llm-floating-launcher { right: 14px; top: 55%; bottom: auto; width: 46px; height: 46px; }
     .llm-floating-overlay { padding: 1.5vh 2vw; }
     .llm-floating-shell { width: 96vw; max-height: 97vh; }
 }
