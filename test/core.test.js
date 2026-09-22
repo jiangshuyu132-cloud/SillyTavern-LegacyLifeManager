@@ -509,6 +509,40 @@ test('trusted old chat uses the live MVU state when message snapshots are unavai
     assert.equal(mismatch.length, 0);
 });
 
+test('old chat rebuilds a missing permanent trust key from a complete protocol chain and two live identity matches', () => {
+    const card = `【当前载体人物设定开始】
+<div><b>世代编号：</b>第2世<br><b>姓名：</b>芙莉莲<br><b>种族：</b>高等精灵<br><b>职业：</b>法师<br><b>当前地点：</b>彩玉区出租屋</div>
+【当前载体人物设定结束】`;
+    const waiting = { 阶段: '等待确认', 当前世代编号: 1, 当前身体死亡已确认: true, 当前身体死亡信息: '旧身体已死亡', 待确认人物卡: '【候选】芙莉莲，高等精灵女性，法师。详细设定见正文候选卡。', 待归档人生词条: '', 归档写入状态: '无待处理' };
+    const active = { 阶段: '当前身体生效', 当前世代编号: 2, 当前身体死亡已确认: false, 当前身体死亡信息: '', 待确认人物卡: '', 待归档人生词条: '词条名称: 第1世·旧身体', 归档写入状态: '待写入世界书' };
+    const messages = [
+        { is_user: false, send_date: 'card', mes: `${card}<UpdateVariable><JSONPatch>${JSON.stringify([{ op: 'replace', path: '/主角/换身状态', value: waiting }])}</JSONPatch></UpdateVariable>` },
+        { is_user: true, send_date: 'confirm', mes: '确认换身' },
+        { is_user: false, send_date: 'commit', mes: `<UpdateVariable><JSONPatch>${JSON.stringify([
+            { op: 'replace', path: '/主角/换身状态', value: active },
+            { op: 'replace', path: '/主角/载体档案', value: { 姓名: '芙莉莲', 种族: '高等精灵', 职业: '法师' } },
+            { op: 'insert', path: '/历代记忆摘要/-', value: { 世代编号: 1, 身体姓名: '旧身体', 详细词条名称: '第1世·旧身体' } },
+        ])}</JSONPatch></UpdateVariable>` },
+    ];
+
+    const recovered = confirmedCarrierRecords(messages, {
+        currentState: { 主角: { 种族: '高等精灵', 职业: ['法师'], 生命值: { 当前: 535 } } },
+    });
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].profile.姓名, '芙莉莲');
+    assert.equal(recovered[0].recoveredFromVerifiedLegacyChain, true);
+
+    assert.equal(confirmedCarrierRecords(messages, {
+        currentState: { 主角: { 种族: '高等精灵', 职业: ['战士'], 生命值: { 当前: 535 } } },
+    }).length, 0);
+    assert.equal(confirmedCarrierRecords(messages, {
+        currentState: { 主角: { 种族: '高等精灵', 生命值: { 当前: 535 } } },
+    }).length, 0);
+    assert.equal(confirmedCarrierRecords(messages, {
+        currentState: { 主角: { 种族: '高等精灵', 职业: ['法师'], 生命值: { 当前: 0 } } },
+    }).length, 0);
+});
+
 test('cross-life money keeps the exact pre-confirmation balance', () => {
     const messages = confirmedFixture();
     messages[0].stat_data.主角.金钱 = 123456;

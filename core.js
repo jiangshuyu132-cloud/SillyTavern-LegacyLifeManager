@@ -652,6 +652,33 @@ function trustedCarrierMatchesCurrentState(stat, profile = {}) {
     return matched > 0;
 }
 
+/**
+ * Last-resort migration proof for old chats whose plugin metadata and message
+ * snapshots were both stripped.  A visible card/confirmation/commit chain is
+ * still insufficient on its own: the live MVU body must be alive and match at
+ * least two stable identity fields.  Any available conflicting field rejects
+ * the recovery.  Location is deliberately excluded because it normally
+ * changes after the hand-off.
+ */
+function verifiedLegacyCarrierMatchesCurrentState(stat, profile = {}) {
+    const main = asObject(stat?.主角);
+    const carrier = asObject(main.载体档案);
+    const hp = Number(main?.生命值?.当前);
+    if (!Object.keys(main).length || !Number.isFinite(hp) || hp <= 0) return false;
+
+    let matched = 0;
+    for (const [stored, expected] of [
+        [carrier.姓名 || main.姓名, profile.姓名],
+        [carrier.种族 || main.种族, profile.种族],
+        [carrier.职业 || main.职业, profile.职业],
+    ]) {
+        if (!comparableCarrierValue(stored) || !comparableCarrierValue(expected)) continue;
+        if (!carrierValuesMatch(stored, expected)) return false;
+        matched += 1;
+    }
+    return matched >= 2;
+}
+
 export function confirmedCarrierRecords(messages = [], options = {}) {
     const timeline = protocolTimeline(messages, {storedOnly:true});
     const recoveredTimeline = protocolTimeline(messages, {recoverMissingProtocol:true});
@@ -686,11 +713,22 @@ export function confirmedCarrierRecords(messages = [], options = {}) {
             const trustedBackupEvidence = recovery
                 && trustedRecordKeys.has(recordKey)
                 && trustedCarrierMatchesCurrentState(currentStoredState, item.profile);
+            const verifiedLegacyEvidence = recovery
+                && !trustedBackupEvidence
+                && Object.keys(suppliedCurrentState).length > 0
+                && verifiedLegacyCarrierMatchesCurrentState(suppliedCurrentState, item.profile);
             const storedEvidence = !recovery
                 || schemaStrippedCommitEvidence(messages,item.cardIndex,i,item.profile)
-                || trustedBackupEvidence;
+                || trustedBackupEvidence
+                || verifiedLegacyEvidence;
             if (storedEvidence && commitGate(before,after,item.profile,generation)) {
-                accepted.push({...item, commitIndex:i, recoveredFromTrustedBackup:trustedBackupEvidence}); consumed.add(generation); committed=true; break;
+                accepted.push({
+                    ...item,
+                    commitIndex:i,
+                    recoveredFromTrustedBackup:trustedBackupEvidence,
+                    recoveredFromVerifiedLegacyChain:verifiedLegacyEvidence,
+                });
+                consumed.add(generation); committed=true; break;
             }
         }
         // A bare confirmation message or an incomplete/failed MVU update is not a commit.

@@ -41,7 +41,7 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 9, injectionMode: 'strict' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 10, injectionMode: 'strict' });
 let initialized = false;
 let archiveInFlight = false;
 let moneyInheritanceInFlight = false;
@@ -81,6 +81,10 @@ function settings() {
         current.dataVersion = 9;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 10) {
+        current.dataVersion = 10;
+        ctx.saveSettingsDebounced?.();
+    }
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
     return current;
 }
@@ -89,7 +93,7 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 9, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 10, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
@@ -100,7 +104,7 @@ function chatData(create = true) {
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 9;
+        data.version = 10;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -124,7 +128,7 @@ function chatData(create = true) {
             if (recordKey && receipt?.status === 'applied') trustedKeys.add(recordKey);
         }
         data.trustedCarrierRecordKeys = [...trustedKeys].slice(-50);
-        if (previousVersion < 9 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
+        if (previousVersion < 10 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
             ctx.saveMetadataDebounced?.();
         }
     }
@@ -286,12 +290,15 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
     backupLedger(data, reason);
     data.currentBody = nextBody;
     data.lives = nextLives;
-    if (record?.recoveredFromTrustedBackup) {
+    if (record?.recoveredFromTrustedBackup || record?.recoveredFromVerifiedLegacyChain) {
+        const usedLegacyChain = record.recoveredFromVerifiedLegacyChain === true;
         data.lastTrustedRecovery = {
             at: new Date().toISOString(),
             recordKey: nextBody?.sourceRecordKey || '',
             name: nextBody?.profile?.姓名 || '',
-            reason: '旧楼层缺少可见状态快照，已用完整人物卡、精确确认口令、提交补丁、可信记录与当前身体状态自动恢复',
+            reason: usedLegacyChain
+                ? '旧楼层快照与插件凭据均缺失，已用完整人物卡、精确确认口令、完整提交补丁及当前身体双字段一致性自动恢复并重建永久凭据'
+                : '旧楼层缺少可见状态快照，已用完整人物卡、精确确认口令、提交补丁、可信记录与当前身体状态自动恢复',
         };
     }
     if (force) data.suppressedRecordKeys = [];
@@ -1347,7 +1354,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.9.3 已加载');
+    console.log('[历代人生管理器] v0.9.4 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
