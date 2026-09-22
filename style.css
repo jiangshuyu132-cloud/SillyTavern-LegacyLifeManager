@@ -391,8 +391,9 @@
 .llm-floating-launcher {
     position: fixed;
     z-index: 30000;
-    right: max(18px, env(safe-area-inset-right));
-    top: 50%;
+    right: auto;
+    left: var(--llm-floating-left, calc(100vw - 70px));
+    top: var(--llm-floating-top, 50%);
     bottom: auto;
     display: grid;
     width: 52px;
@@ -407,12 +408,15 @@
     font-size: 1.05rem;
     font-weight: 700;
     box-shadow: 0 8px 28px rgb(71 48 151 / 48%), inset 0 1px rgb(255 255 255 / 28%);
-    cursor: pointer;
-    transform: translateY(-50%);
+    cursor: grab;
+    transform: none;
+    touch-action: none;
+    user-select: none;
 }
+.llm-floating-launcher[data-dragging="true"] { cursor: grabbing; }
 
 .llm-floating-launcher::after { position: absolute; inset: -5px; border: 1px solid rgb(218 200 255 / 28%); border-radius: 50%; content: ''; }
-.llm-floating-launcher:hover { transform: translateY(-2px); filter: brightness(1.08); }
+.llm-floating-launcher:hover { filter: brightness(1.08); }
 .llm-floating-overlay { position: fixed; z-index: 30010; inset: 0; display: grid; padding: 3vh 3vw; place-items: center; background: rgb(3 5 9 / 72%); backdrop-filter: blur(5px); }
 .llm-floating-overlay[hidden] { display: none !important; }
 .llm-floating-shell { display: grid; width: min(980px, 94vw); max-height: 94vh; overflow: hidden; grid-template-rows: auto minmax(0, 1fr); border: 1px solid rgb(164 174 204 / 32%); border-radius: 18px; background: #0d1017; box-shadow: 0 24px 80px rgb(0 0 0 / 62%); }
@@ -517,7 +521,7 @@
     .llm-summary-grid { grid-template-columns: 1fr; }
     .llm-runtime-list { grid-template-columns: 1fr; }
     .llm-actions > button { flex: 1 1 100%; }
-    .llm-floating-launcher { right: 14px; top: 55%; bottom: auto; width: 46px; height: 46px; }
+    .llm-floating-launcher { width: 46px; height: 46px; }
     .llm-floating-overlay { padding: 1.5vh 2vw; }
     .llm-floating-shell { width: 96vw; max-height: 97vh; }
 }

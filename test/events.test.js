@@ -9,7 +9,7 @@ globalThis.confirm=()=>true;
 globalThis.getVariables=opts=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;return {stat_data:ctx.chat[index]?.stat_data};};
 globalThis.updateVariablesWith=(fn,opts)=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;const next=fn({stat_data:ctx.chat[index].stat_data});ctx.chat[index].stat_data=next.stat_data;};
 globalThis.fetch=async()=>{fetchCount++;if(changeDuringRead)ctx.chatId='different-chat';return {ok:readbackOK,async json(){return structuredClone(book);}};};
-const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance,updateCurrentBodyPrompt};';
+const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance,updateCurrentBodyPrompt,backupDigest,importBackupPayload};';
 const plugin=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const card='【当前载体人物设定开始】\n<div><b>世代编号：</b>第2世<br><b>姓名：</b>新身体<br></div>\n【当前载体人物设定结束】';
 const draft='词条名称: 第1世·旧身体\n重要人物: 守卫\n重要经历：守住城门。';
@@ -25,7 +25,11 @@ test('浮动入口带有脚本内关键样式，旧 CSS 缓存也不会把按钮
  assert.match(source,/position: fixed !important/);
  assert.match(source,/z-index: 2147483000 !important/);
  assert.match(source,/forceFloatingLauncherVisible\(existingLauncher\)/);
- assert.ok(source.indexOf('ensureFloatingRuntimeStyles();') < source.indexOf("const existingLauncher = document.getElementById('legacy-life-manager-floating')"));
+ assert.match(source,/installFloatingDrag\(existingLauncher\)/);
+ assert.match(source,/pointermove/);
+ assert.match(source,/floatingPosition/);
+ const ensureSource=source.slice(source.indexOf('function ensureFloatingLauncher()'));
+ assert.ok(ensureSource.indexOf('ensureFloatingRuntimeStyles();') < ensureSource.indexOf("document.getElementById('legacy-life-manager-floating')"));
 });
 test('真实归档回调写入、后端回读后清理，重复点击不增词条',async()=>{
  setup();await plugin.archivePendingLife();assert.equal(saveCount,1);assert.equal(fetchCount,1);assert.equal(Object.keys(book.entries).length,1);assert.equal(ctx.chat[2].stat_data.主角.换身状态.待归档人生词条,'');await assert.rejects(plugin.archivePendingLife(),/有效待归档/);assert.equal(saveCount,1);
@@ -66,6 +70,54 @@ test('严格主档案每轮发送完整人物卡并保留正文变量模块',()=
  assert.match(prompt.prompt,/必须同时读取本插件档案与正文已有的 <status_current_variables>\/stat_data/);
  assert.match(prompt.prompt,/物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场/);
  assert.match(prompt.prompt,/【当前载体人物设定开始】/);
+});
+test('实时变量没有姓名但种族职业双字段一致时仍向AI注入完整档案',()=>{
+ const after=setup();ctx.chat.push({is_user:true,mes:'继续生活'});
+ after.主角.种族='高等精灵';after.主角.职业=['法师'];delete after.主角.载体档案;
+ const richCard='【当前载体人物设定开始】\n<b>姓名：</b>新身体<br><b>种族：</b>高等精灵<br><b>职业：</b>法师<br>完整人物细节\n【当前载体人物设定结束】';
+ const body={profile:{姓名:'新身体',种族:'高等精灵',职业:'法师'},rawCard:richCard,text:richCard};
+ const prompt=plugin.buildCurrentBodyPrompt(body,after,'strict');
+ assert.match(prompt.prompt,/完整人物细节/);
+ assert.equal(prompt.effectiveMode,'严格主档案·每轮完整');
+});
+test('完整备份导入后恢复当前身体并通过AI上下文注入回读验证',async()=>{
+ const after=setup();plugin.reconcileConversation();
+ const ledger=structuredClone(ctx.chatMetadata.legacy_life_manager);
+ const richCard='【当前载体人物设定开始】\n<b>姓名：</b>新身体<br><b>种族：</b>高等精灵<br><b>职业：</b>法师<br>备份中的完整人物细节\n【当前载体人物设定结束】';
+ ledger.currentBody={...ledger.currentBody,profile:{...ledger.currentBody.profile,种族:'高等精灵',职业:'法师'},rawCard:richCard,text:richCard};
+ after.主角.种族='高等精灵';after.主角.职业=['法师'];delete after.主角.载体档案;
+ const payload={format:'sillytavern-legacy-life-backup',version:2,exportedAt:new Date().toISOString(),chatId:'test',statData:structuredClone(after),worldBookName:'',pluginSettings:{worldBookName:'现有测试世界书',injectionMode:'compact',floatingPosition:{xRatio:0.25,yRatio:0.75}},pluginLedger:ledger,archiveEntries:[],transcript:[]};
+ const envelope={...payload,integrity:await plugin.backupDigest(payload)};
+ ctx.chatMetadata.legacy_life_manager.currentBody=null;ctx.chatMetadata.legacy_life_manager.lives=[];
+ ctx.chat[0].mes='旧楼层正文已被总结助手隐藏';ctx.chat[0].swipes=[];
+ ctx.chat.push({is_user:true,mes:'继续生活'});
+ const result=await plugin.importBackupPayload(envelope,{ask:false});
+ assert.equal(result.activated,true);
+ assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
+ assert.equal(ctx.extensionSettings.legacy_life_manager.injectionMode,'strict');
+ assert.deepEqual(ctx.extensionSettings.legacy_life_manager.floatingPosition,{xRatio:0.25,yRatio:0.75});
+ assert.equal(ctx.chatMetadata.legacy_life_manager.aiInjectionReceipt.verified,true);
+ assert.equal(ctx.chatMetadata.legacy_life_manager.aiInjectionReceipt.bodyName,'新身体');
+ assert.match(injectedPrompt,/备份中的完整人物细节/);
+ assert.match(injectedPrompt,/confirmed-plugin-dossier-first/);
+});
+test('损坏的完整备份会被拒绝，注入失败则同时回滚账本和设置',async()=>{
+ const after=setup();plugin.reconcileConversation();ctx.chat.push({is_user:true,mes:'继续生活'});
+ const ledger=structuredClone(ctx.chatMetadata.legacy_life_manager);
+ const richCard='【当前载体人物设定开始】\n<b>姓名：</b>新身体<br><b>种族：</b>高等精灵<br><b>职业：</b>法师<br>不可丢失的档案\n【当前载体人物设定结束】';
+ ledger.currentBody={...ledger.currentBody,profile:{...ledger.currentBody.profile,种族:'高等精灵',职业:'法师'},rawCard:richCard,text:richCard};
+ after.主角.种族='高等精灵';after.主角.职业=['法师'];
+ const payload={format:'sillytavern-legacy-life-backup',version:2,exportedAt:new Date().toISOString(),chatId:'test',pluginSettings:{floatingPosition:{xRatio:0.2,yRatio:0.3}},pluginLedger:ledger,archiveEntries:[],transcript:[]};
+ const envelope={...payload,integrity:await plugin.backupDigest(payload)};
+ const damaged=structuredClone(envelope);damaged.pluginLedger.currentBody.text+='被篡改';
+ await assert.rejects(plugin.importBackupPayload(damaged,{ask:false}),/完整性校验失败/);
+ const beforeLedger=structuredClone(ctx.chatMetadata.legacy_life_manager);
+ ctx.extensionSettings.legacy_life_manager={dataVersion:12,injectionMode:'compact',floatingPosition:{xRatio:0.9,yRatio:0.1}};
+ ctx.setExtensionPrompt=async()=>{throw new Error('模拟酒馆注入失败');};
+ await assert.rejects(plugin.importBackupPayload(envelope,{ask:false}),/导入已回滚/);
+ assert.deepEqual(ctx.chatMetadata.legacy_life_manager,beforeLedger);
+ assert.equal(ctx.extensionSettings.legacy_life_manager.injectionMode,'compact');
+ assert.deepEqual(ctx.extensionSettings.legacy_life_manager.floatingPosition,{xRatio:0.9,yRatio:0.1});
 });
 test('人生背景作为独立当前身体资料实际进入每轮AI上下文',()=>{
  const after=setup();ctx.chat.push({is_user:true,mes:'继续生活'});

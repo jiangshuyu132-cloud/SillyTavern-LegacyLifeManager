@@ -25,6 +25,7 @@ import {
     isSafeRuntimePatch,
     lifeHistorySummaries,
     liveBodyState,
+    messageTextVariants,
     mergeLifeRecords,
     normalizedMoney,
     normalizeEntries,
@@ -42,7 +43,7 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 11, injectionMode: 'strict' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 12, injectionMode: 'strict', floatingPosition: null });
 const RUNTIME_TOKEN = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 let initialized = false;
 let archiveInFlight = false;
@@ -91,6 +92,11 @@ function settings() {
         current.dataVersion = 11;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 12) {
+        current.floatingPosition ??= null;
+        current.dataVersion = 12;
+        ctx.saveSettingsDebounced?.();
+    }
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
     return current;
 }
@@ -99,7 +105,7 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 11, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 12, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
@@ -110,7 +116,7 @@ function chatData(create = true) {
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 11;
+        data.version = 12;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -134,7 +140,7 @@ function chatData(create = true) {
             if (recordKey && receipt?.status === 'applied') trustedKeys.add(recordKey);
         }
         data.trustedCarrierRecordKeys = [...trustedKeys].slice(-50);
-        if (previousVersion < 11 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
+        if (previousVersion < 12 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
             ctx.saveMetadataDebounced?.();
         }
     }
@@ -493,7 +499,12 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         }
         return {prompt:'',effectiveMode:`暂停注入·${special}`};
     }
-    if (body.profile?.姓名 && statData?.主角?.载体档案?.姓名 !== body.profile.姓名) return {prompt:'',effectiveMode:'等待MVU当前身体同步'};
+    if (body.profile?.姓名) {
+        const liveName = String(statData?.主角?.载体档案?.姓名 || statData?.主角?.姓名 || '').trim();
+        const nameConflicts = liveName && liveName !== String(body.profile.姓名).trim();
+        const unnamedStateMatches = !liveName && carrierProfileMatchesCurrentState(statData, body.profile, 2);
+        if (nameConflicts || (!liveName && !unnamedStateMatches)) return {prompt:'',effectiveMode:'等待MVU当前身体同步'};
+    }
     const messages = protocolMessages();
     const profile = JSON.stringify(body.profile || {}, null, 2);
     const strict = mode === 'strict';
@@ -652,6 +663,161 @@ async function archivePendingLife() {
     } finally { archiveInFlight=false; }
 }
 
+async function backupDigest(payload) {
+    const text = JSON.stringify(payload);
+    if (globalThis.crypto?.subtle && typeof TextEncoder === 'function') {
+        const bytes = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+        return { algorithm: 'SHA-256', digest: [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('') };
+    }
+    return { algorithm: 'FNV1A', digest: stableTextFingerprint(text) };
+}
+
+async function verifyBackupEnvelope(envelope) {
+    if (envelope?.format !== 'sillytavern-legacy-life-backup') throw new Error('这不是历代人生管理器备份文件');
+    const version = Number(envelope?.version || 0);
+    if (![1, 2].includes(version)) throw new Error(`不支持的备份版本：${version || '未知'}`);
+    if (!asObject(envelope.pluginLedger).currentBody && !(asObject(envelope.pluginLedger).lives || []).length) {
+        throw new Error('备份中没有当前身体或历代人生资料');
+    }
+    if (version >= 2) {
+        const payload = { ...envelope };
+        delete payload.integrity;
+        const actual = await backupDigest(payload);
+        if (!envelope.integrity?.digest || envelope.integrity.algorithm !== actual.algorithm || envelope.integrity.digest !== actual.digest) {
+            throw new Error('备份完整性校验失败，文件可能被截断或修改');
+        }
+    }
+    return version;
+}
+
+function normalizedImportedBody(value) {
+    const body = asObject(value);
+    const rawCard = String(body.rawCard || body.text || '').trim();
+    const profile = asObject(body.profile);
+    if (!rawCard || !String(profile.姓名 || '').trim()) return null;
+    return {
+        ...structuredClone(body),
+        profile: structuredClone(profile),
+        rawCard,
+        text: String(body.text || carrierCardText(rawCard) || rawCard),
+        sections: Array.isArray(body.sections) ? structuredClone(body.sections) : carrierCardSections(rawCard),
+        backgroundStory: String(body.backgroundStory || carrierBackgroundStory(rawCard) || ''),
+        confirmed: true,
+        sourceType: 'conversation',
+        sourceCardFingerprint: body.sourceCardFingerprint || stableTextFingerprint(rawCard),
+    };
+}
+
+async function importBackupPayload(envelope, { ask = true } = {}) {
+    const ctx = context();
+    if (!activeChat()) throw new Error('请先打开需要恢复的聊天');
+    const backupVersion = await verifyBackupEnvelope(envelope);
+    const importedLedger = asObject(envelope.pluginLedger);
+    const importedBody = normalizedImportedBody(importedLedger.currentBody);
+    const importedLives = Array.isArray(importedLedger.lives) ? importedLedger.lives : [];
+    const exportedAt = String(envelope.exportedAt || '时间未知');
+    const sourceChat = String(envelope.chatId || '未知聊天');
+    const targetChat = String(ctx.chatId || ctx.groupId || '');
+    const crossChat = sourceChat && sourceChat !== '未知聊天' && sourceChat !== targetChat;
+    const preview = `备份时间：${exportedAt}\n当前身体：${importedBody?.profile?.姓名 || '无'}\n历代人生：${importedLives.length} 条${crossChat ? '\n\n注意：备份来自另一个聊天。' : ''}\n\n导入前会自动保存当前插件账本；只有与当前实时身体至少两个稳定身份字段一致，才会恢复为当前身体并写入 AI 上下文。`;
+    if (ask && !globalThis.confirm(`确认导入这份备份？\n\n${preview}`)) return { cancelled: true };
+
+    const current = chatData();
+    const before = structuredClone(current);
+    const beforeSettings = structuredClone(settings());
+    const liveState = readEffectiveStatData().statData || readStatData() || {};
+    const canActivate = Boolean(importedBody && carrierProfileMatchesCurrentState(liveState, importedBody.profile, 2));
+    const importedBackups = Array.isArray(importedLedger.backups) ? importedLedger.backups : [];
+    const restorePoint = { at: new Date().toISOString(), reason: '导入外部备份前自动保存', currentBody: before.currentBody, lives: before.lives || [] };
+
+    current.version = 12;
+    current.protocolVersion = 'dusk.1';
+    current.lives = mergeLifeRecords(current.lives || [], importedLives);
+    current.backups = [...(current.backups || []), restorePoint, ...structuredClone(importedBackups)].slice(-12);
+    if (importedBody && !canActivate) current.backups.push({ at: new Date().toISOString(), reason: '已导入但未通过当前身体核对', currentBody: importedBody, lives: structuredClone(importedLives) });
+    current.backups = current.backups.slice(-12);
+    current.portraits = { ...asObject(importedLedger.portraits), ...asObject(current.portraits) };
+    current.moneyInheritance = { ...asObject(importedLedger.moneyInheritance), ...asObject(current.moneyInheritance) };
+    current.trustedCarrierRecordKeys = [...new Set([
+        ...(Array.isArray(importedLedger.trustedCarrierRecordKeys) ? importedLedger.trustedCarrierRecordKeys : []),
+        ...(Array.isArray(current.trustedCarrierRecordKeys) ? current.trustedCarrierRecordKeys : []),
+        importedBody?.sourceRecordKey,
+    ].filter(Boolean))].slice(-100);
+    current.pendingSnapshot ??= structuredClone(importedLedger.pendingSnapshot || null);
+    current.legacyMigrationBackup ??= structuredClone(importedLedger.legacyMigrationBackup || null);
+    current.lastExternalImport = { at: new Date().toISOString(), exportedAt, sourceChat, backupVersion, activated: canActivate };
+    if (canActivate) current.currentBody = importedBody;
+    saveChatMetadata();
+
+    if (!canActivate) {
+        await render();
+        notify('warning', `备份已安全保存，但未替换当前身体：实时姓名、种族或职业不足两项一致。资料可在插件备份中保留。`);
+        return { imported: true, activated: false };
+    }
+
+    const currentSettings = settings();
+    const importedSettings = asObject(envelope.pluginSettings);
+    const importedPosition = asObject(importedSettings.floatingPosition);
+    if (Number.isFinite(Number(importedPosition.xRatio)) && Number.isFinite(Number(importedPosition.yRatio))) {
+        currentSettings.floatingPosition = {
+            xRatio: Math.min(1, Math.max(0, Number(importedPosition.xRatio))),
+            yRatio: Math.min(1, Math.max(0, Number(importedPosition.yRatio))),
+        };
+    }
+    const importedBook = String(importedSettings.worldBookName || '').trim();
+    if (importedBook && (ctx.getWorldInfoNames?.() || []).includes(importedBook)) currentSettings.worldBookName = importedBook;
+    currentSettings.injectionMode = 'strict';
+    saveSettings();
+    const launcher = document.getElementById('legacy-life-manager-floating');
+    if (launcher) forceFloatingLauncherVisible(launcher);
+    try {
+        if (typeof ctx.setExtensionPrompt !== 'function') throw new Error('酒馆没有提供 AI 上下文注入接口');
+        await updateCurrentBodyPrompt();
+        const bodyName = String(importedBody.profile?.姓名 || '');
+        const injected = lastPromptText.includes('<legacy_life_current_body')
+            && lastPromptText.includes(bodyName)
+            && lastPromptText.includes('authority="confirmed-plugin-dossier-first"');
+        if (!injected) throw new Error('导入后人物档案未通过 AI 上下文回读验证');
+        current.aiInjectionReceipt = {
+            at: new Date().toISOString(),
+            promptKey: PROMPT_KEY,
+            bodyName,
+            promptFingerprint: stableTextFingerprint(lastPromptText),
+            characters: lastPromptText.length,
+            mode: 'strict',
+            verified: true,
+        };
+        saveChatMetadata();
+    } catch (error) {
+        ctx.chatMetadata[METADATA_KEY] = before;
+        ctx.extensionSettings[EXTENSION_KEY] = beforeSettings;
+        saveChatMetadata();
+        saveSettings();
+        await updateCurrentBodyPrompt().catch(() => {});
+        throw new Error(`导入已回滚：${error.message}`);
+    }
+    await render();
+    notify('success', `已恢复“${importedBody.profile.姓名}”，并验证完整人物档案已写入 AI 上下文`);
+    return { imported: true, activated: true, name: importedBody.profile.姓名 };
+}
+
+async function chooseBackupImport() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.addEventListener('change', async () => {
+        try {
+            const file = input.files?.[0];
+            if (!file) return;
+            if (file.size > 40 * 1024 * 1024) throw new Error('备份文件超过 40MB，已停止读取');
+            await importBackupPayload(JSON.parse(await file.text()));
+        } catch (error) {
+            notify('error', error.message || '备份导入失败');
+        }
+    }, { once: true });
+    input.click();
+}
+
 async function exportBackup() {
     const ctx = context();
     const { statData } = readEffectiveStatData();
@@ -662,16 +828,24 @@ async function exportBackup() {
         role: message?.is_system ? 'system' : message?.is_user ? 'user' : 'assistant',
         name: message?.name || '',
         text: message?.mes || '',
+        textVariants: messageTextVariants(message),
         sendDate: message?.send_date || null,
     }));
-    downloadJson(`历代人生备份-${Date.now()}.json`, {
-        format: 'sillytavern-legacy-life-backup', version: 1, exportedAt: new Date().toISOString(),
+    const payload = {
+        format: 'sillytavern-legacy-life-backup', version: 2, exportedAt: new Date().toISOString(),
         chatId: ctx?.chatId || ctx?.groupId || '', statData, worldBookName: name,
+        pluginSettings: {
+            worldBookName: String(settings().worldBookName || ''),
+            injectionMode: String(settings().injectionMode || 'strict'),
+            floatingPosition: structuredClone(settings().floatingPosition || null),
+        },
         pluginLedger: structuredClone(chatData(false)),
         archiveEntries: book ? Object.values(normalizeEntries(book)).filter(entry => String(entry?.comment || '').startsWith(ARCHIVE_PREFIX)) : [],
         transcript,
-    });
-    notify('success', '已导出当前身体、历代词条和完整聊天原文');
+    };
+    const integrity = await backupDigest(payload);
+    downloadJson(`历代人生备份-${Date.now()}.json`, { ...payload, integrity });
+    notify('success', '已导出带完整性校验的当前身体、历代词条、头像和聊天原文');
 }
 
 function capturePendingSnapshot(statData) {
@@ -1049,7 +1223,7 @@ function renderSettings(panel) {
         createButton('清空本聊天插件记录', clearCurrentChatLedger),
     );
     const safety = el('div', 'llm-safety');
-    safety.textContent = '当前正文是事实来源：删除、编辑、切换或重生成相关楼层后，插件会撤销失去来源的身体、历代记录和 AI 注入。已经写入世界书的词条不会自动删除。';
+    safety.textContent = '普通总结、隐藏和刷新不会清空已确认身体。主动“从当前正文重新同步”会严格按当前可见正文重建。外部备份导入后必须通过实时身份核对，并会自动切换严格主档案、回读确认人物资料已写入 AI 上下文。';
     const archiveCard = el('section', 'llm-control-card');
     archiveCard.append(label, select, active);
     const aiCard = el('section', 'llm-control-card');
@@ -1057,7 +1231,12 @@ function renderSettings(panel) {
     const importCard = el('section', 'llm-control-card');
     importCard.append(importLabel, importActions);
     const maintenanceCard = el('section', 'llm-control-card');
-    maintenanceCard.append(ledgerActions, safety, createButton('导出完整备份', exportBackup, 'menu_button llm-primary'));
+    const backupActions = el('div', 'llm-actions');
+    backupActions.append(
+        createButton('导出完整备份', exportBackup, 'menu_button llm-primary'),
+        createButton('导入完整备份', chooseBackupImport, 'menu_button llm-primary'),
+    );
+    maintenanceCard.append(ledgerActions, safety, backupActions);
     panel.append(
         el('h3', 'llm-section-title', '世界书与 AI 注入'),
         archiveCard,
@@ -1136,8 +1315,9 @@ function ensureFloatingRuntimeStyles() {
         #legacy-life-manager-floating.llm-floating-launcher {
             position: fixed !important;
             z-index: 2147483000 !important;
-            right: max(18px, env(safe-area-inset-right)) !important;
-            top: 50% !important;
+            right: auto !important;
+            top: var(--llm-floating-top, 50%) !important;
+            left: var(--llm-floating-left, calc(100vw - 70px)) !important;
             bottom: auto !important;
             display: grid !important;
             width: 52px !important;
@@ -1158,9 +1338,12 @@ function ensureFloatingRuntimeStyles() {
             font-weight: 700 !important;
             line-height: 1 !important;
             box-shadow: 0 8px 28px rgb(71 48 151 / 48%), inset 0 1px rgb(255 255 255 / 28%) !important;
-            cursor: pointer !important;
-            transform: translateY(-50%) !important;
+            cursor: grab !important;
+            transform: none !important;
+            touch-action: none !important;
+            user-select: none !important;
         }
+        #legacy-life-manager-floating.llm-floating-launcher[data-dragging="true"] { cursor: grabbing !important; }
         #legacy-life-manager-floating.llm-floating-launcher::after {
             position: absolute;
             inset: -5px;
@@ -1218,9 +1401,6 @@ function ensureFloatingRuntimeStyles() {
         body.llm-floating-open #legacy-life-manager-root .inline-drawer-icon { display: none !important; }
         @media (max-width: 720px) {
             #legacy-life-manager-floating.llm-floating-launcher {
-                right: 14px !important;
-                top: 55% !important;
-                bottom: auto !important;
                 width: 46px !important;
                 height: 46px !important;
                 min-width: 46px !important;
@@ -1232,12 +1412,26 @@ function ensureFloatingRuntimeStyles() {
     `;
 }
 
+function floatingLauncherPosition(launcher) {
+    const size = Math.max(46, Number(launcher?.offsetWidth) || 52);
+    const maxX = Math.max(8, Number(globalThis.innerWidth || document.documentElement?.clientWidth || 800) - size - 8);
+    const maxY = Math.max(8, Number(globalThis.innerHeight || document.documentElement?.clientHeight || 600) - size - 8);
+    const saved = asObject(settings().floatingPosition);
+    const xRatio = Number(saved.xRatio);
+    const yRatio = Number(saved.yRatio);
+    const x = Number.isFinite(xRatio) ? 8 + Math.min(1, Math.max(0, xRatio)) * (maxX - 8) : maxX;
+    const y = Number.isFinite(yRatio) ? 8 + Math.min(1, Math.max(0, yRatio)) * (maxY - 8) : Math.round(maxY / 2);
+    return { x, y, maxX, maxY };
+}
+
 function forceFloatingLauncherVisible(launcher) {
+    const { x, y } = floatingLauncherPosition(launcher);
     const important = {
         position: 'fixed',
         'z-index': '2147483000',
-        right: 'max(18px, env(safe-area-inset-right))',
-        top: '50%',
+        right: 'auto',
+        left: `${Math.round(x)}px`,
+        top: `${Math.round(y)}px`,
         bottom: 'auto',
         display: 'grid',
         width: '52px',
@@ -1249,30 +1443,89 @@ function forceFloatingLauncherVisible(launcher) {
         'place-items': 'center',
         opacity: '1',
         visibility: 'visible',
-        transform: 'translateY(-50%)',
+        transform: 'none',
+        'touch-action': 'none',
     };
     for (const [name, value] of Object.entries(important)) launcher.style.setProperty(name, value, 'important');
+}
+
+function installFloatingDrag(launcher) {
+    let drag = null;
+    launcher.addEventListener('pointerdown', event => {
+        if (event.button !== 0 && event.pointerType !== 'touch') return;
+        const rect = launcher.getBoundingClientRect();
+        drag = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, left: rect.left, top: rect.top, moved: false };
+        launcher.dataset.dragging = 'true';
+        launcher.setPointerCapture?.(event.pointerId);
+    });
+    launcher.addEventListener('pointermove', event => {
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const dx = event.clientX - drag.startX;
+        const dy = event.clientY - drag.startY;
+        if (Math.hypot(dx, dy) > 4) drag.moved = true;
+        if (!drag.moved) return;
+        event.preventDefault();
+        const { maxX, maxY } = floatingLauncherPosition(launcher);
+        const x = Math.min(maxX, Math.max(8, drag.left + dx));
+        const y = Math.min(maxY, Math.max(8, drag.top + dy));
+        launcher.style.setProperty('left', `${Math.round(x)}px`, 'important');
+        launcher.style.setProperty('top', `${Math.round(y)}px`, 'important');
+    });
+    const finish = event => {
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const moved = drag.moved;
+        launcher.releasePointerCapture?.(event.pointerId);
+        launcher.dataset.dragging = 'false';
+        drag = null;
+        if (!moved) return;
+        const rect = launcher.getBoundingClientRect();
+        const { maxX, maxY } = floatingLauncherPosition(launcher);
+        settings().floatingPosition = {
+            xRatio: maxX > 8 ? Math.min(1, Math.max(0, (rect.left - 8) / (maxX - 8))) : 0,
+            yRatio: maxY > 8 ? Math.min(1, Math.max(0, (rect.top - 8) / (maxY - 8))) : 0,
+        };
+        launcher.dataset.suppressClick = 'true';
+        setTimeout(() => { launcher.dataset.suppressClick = 'false'; }, 0);
+        saveSettings();
+    };
+    launcher.addEventListener('pointerup', finish);
+    launcher.addEventListener('pointercancel', finish);
+    globalThis.addEventListener?.('resize', () => forceFloatingLauncherVisible(launcher));
 }
 
 function ensureFloatingLauncher() {
     if (!document.body) return;
     ensureFloatingRuntimeStyles();
-    const existingLauncher = document.getElementById('legacy-life-manager-floating');
+    let existingLauncher = document.getElementById('legacy-life-manager-floating');
     if (existingLauncher) {
+        const replacement = existingLauncher.cloneNode(true);
+        existingLauncher.replaceWith(replacement);
+        existingLauncher = replacement;
         existingLauncher.classList.add('llm-floating-launcher');
         existingLauncher.textContent = '历';
-        existingLauncher.title = '打开历代人生管理器';
-        existingLauncher.setAttribute('aria-label', '打开历代人生管理器');
+        existingLauncher.title = '拖动可移动；点击打开历代人生管理器';
+        existingLauncher.setAttribute('aria-label', '可拖动的历代人生管理器入口');
         forceFloatingLauncherVisible(existingLauncher);
-        return;
+        installFloatingDrag(existingLauncher);
+        existingLauncher.addEventListener('click', () => {
+            if (existingLauncher.dataset.suppressClick === 'true') return;
+            openFloatingPanel().catch(error => notify('error', error.message || '无法打开浮动面板'));
+        });
+        if (document.getElementById('legacy-life-manager-floating-overlay')) return;
     }
-    const launcher = el('button', 'llm-floating-launcher', '历');
-    launcher.id = 'legacy-life-manager-floating';
-    launcher.type = 'button';
-    launcher.title = '打开历代人生管理器';
-    launcher.setAttribute('aria-label', '打开历代人生管理器');
-    forceFloatingLauncherVisible(launcher);
-    launcher.addEventListener('click', () => openFloatingPanel().catch(error => notify('error', error.message || '无法打开浮动面板')));
+    const launcher = existingLauncher || el('button', 'llm-floating-launcher', '历');
+    if (!existingLauncher) {
+        launcher.id = 'legacy-life-manager-floating';
+        launcher.type = 'button';
+        launcher.title = '拖动可移动；点击打开历代人生管理器';
+        launcher.setAttribute('aria-label', '可拖动的历代人生管理器入口');
+        forceFloatingLauncherVisible(launcher);
+        installFloatingDrag(launcher);
+        launcher.addEventListener('click', () => {
+            if (launcher.dataset.suppressClick === 'true') return;
+            openFloatingPanel().catch(error => notify('error', error.message || '无法打开浮动面板'));
+        });
+    }
 
     const overlay = el('div', 'llm-floating-overlay');
     overlay.id = 'legacy-life-manager-floating-overlay';
@@ -1291,7 +1544,8 @@ function ensureFloatingLauncher() {
     overlay.append(shell);
     overlay.addEventListener('click', event => { if (event.target === overlay) closeFloatingPanel(); });
     document.addEventListener('keydown', event => { if (event.key === 'Escape' && !overlay.hidden) closeFloatingPanel(); });
-    document.body.append(launcher, overlay);
+    if (!launcher.isConnected) document.body.append(launcher);
+    document.body.append(overlay);
 }
 
 function activateTab(id) {
@@ -1407,7 +1661,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.9.5 已加载');
+    console.log('[历代人生管理器] v0.10.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
