@@ -656,7 +656,14 @@ export function confirmedCarrierRecords(messages = [], options = {}) {
     const timeline = protocolTimeline(messages, {storedOnly:true});
     const recoveredTimeline = protocolTimeline(messages, {recoverMissingProtocol:true});
     const trustedRecordKeys = new Set(options?.trustedRecordKeys || []);
-    const currentStoredState = timeline.at(-1) || {};
+    // In a live SillyTavern session the current MVU value can be available
+    // through the public variable API even when old message objects do not
+    // expose their stat_data snapshots. Prefer that live value for trusted
+    // recovery; exported JSONL files can still fall back to their timeline.
+    const suppliedCurrentState = asObject(options?.currentState);
+    const currentStoredState = Object.keys(suppliedCurrentState).length
+        ? suppliedCurrentState
+        : (timeline.at(-1) || {});
     const accepted = [], consumed = new Set();
     for (const item of unvalidatedCarrierRecords(messages)) {
         if (isDiscussion(messages[item.cardIndex]) || isDiscussion(messages[item.confirmationIndex])) continue;

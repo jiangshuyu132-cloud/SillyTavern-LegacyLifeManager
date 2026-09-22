@@ -41,7 +41,7 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 8, injectionMode: 'strict' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 9, injectionMode: 'strict' });
 let initialized = false;
 let archiveInFlight = false;
 let moneyInheritanceInFlight = false;
@@ -77,8 +77,8 @@ function settings() {
         current.dataVersion = 7;
         ctx.saveSettingsDebounced?.();
     }
-    if (Number(current.dataVersion || 0) < 8) {
-        current.dataVersion = 8;
+    if (Number(current.dataVersion || 0) < 9) {
+        current.dataVersion = 9;
         ctx.saveSettingsDebounced?.();
     }
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
@@ -89,23 +89,44 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 8, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {} };
+        ctx.chatMetadata[METADATA_KEY] = { version: 9, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
+        const previousVersion = Number(data.version || 0);
         if (data.protocolVersion !== 'dusk.1') {
             // Permanent one-time copy: stricter proof must not destroy a legacy ledger.
             data.legacyMigrationBackup ??= {at:new Date().toISOString(),data:structuredClone(data)};
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 8;
+        data.version = 9;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
         data.backups ??= [];
         data.portraits ??= {};
         data.moneyInheritance ??= {};
+        data.trustedCarrierRecordKeys ??= [];
+        const previousTrustedKeys = JSON.stringify(data.trustedCarrierRecordKeys);
+        // Keep verified record keys outside the rolling backup list. World-book
+        // backups share the old list and can evict a body backup, but must not
+        // make an already confirmed identity disappear after an update.
+        const trustedKeys = new Set(data.trustedCarrierRecordKeys.filter(Boolean));
+        const legacyBody = data.legacyMigrationBackup?.data?.currentBody;
+        const bodies = [data.currentBody, legacyBody, ...(data.backups || []).map(item => item?.currentBody)];
+        for (const body of bodies) {
+            if (body?.confirmed === true && body?.sourceType === 'conversation' && body?.sourceRecordKey) {
+                trustedKeys.add(body.sourceRecordKey);
+            }
+        }
+        for (const [recordKey, receipt] of Object.entries(data.moneyInheritance)) {
+            if (recordKey && receipt?.status === 'applied') trustedKeys.add(recordKey);
+        }
+        data.trustedCarrierRecordKeys = [...trustedKeys].slice(-50);
+        if (previousVersion < 9 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
+            ctx.saveMetadataDebounced?.();
+        }
     }
     return data;
 }
@@ -192,14 +213,34 @@ function backupLedger(data, reason) {
 }
 
 function trustedCarrierOptions(data = chatData(false)) {
-    const keys = [];
-    const bodies = [data?.currentBody, ...(data?.backups || []).map(item => item?.currentBody)];
+    const keys = [...(data?.trustedCarrierRecordKeys || [])];
+    const bodies = [
+        data?.currentBody,
+        data?.legacyMigrationBackup?.data?.currentBody,
+        ...(data?.backups || []).map(item => item?.currentBody),
+    ];
     for (const body of bodies) {
         if (body?.confirmed === true && body?.sourceType === 'conversation' && body?.sourceRecordKey) {
             keys.push(body.sourceRecordKey);
         }
     }
-    return { trustedRecordKeys: [...new Set(keys)] };
+    for (const [recordKey, receipt] of Object.entries(data?.moneyInheritance || {})) {
+        if (recordKey && receipt?.status === 'applied') keys.push(recordKey);
+    }
+    return {
+        trustedRecordKeys: [...new Set(keys)],
+        currentState: readStatData() || {},
+    };
+}
+
+function rememberTrustedCarrierRecord(data, record, messages) {
+    const recordKey = carrierRecordKey(record, messages);
+    if (!recordKey) return false;
+    data.trustedCarrierRecordKeys ??= [];
+    if (data.trustedCarrierRecordKeys.includes(recordKey)) return false;
+    data.trustedCarrierRecordKeys.push(recordKey);
+    data.trustedCarrierRecordKeys = data.trustedCarrierRecordKeys.slice(-50);
+    return true;
 }
 
 function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
@@ -231,17 +272,28 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
     const previous = data.currentBody;
     let nextLives = truth.lives;
     let nextBody = record ? bodyFromConfirmedRecord(record, messages, nextLives, previous) : null;
-
+    const remembered = record ? rememberTrustedCarrierRecord(data, record, messages) : false;
 
     const previousKey = previous?.sourceRecordKey || previous?.sourceCardFingerprint
         || (previous?.rawCard ? stableTextFingerprint(previous.rawCard) : '');
     const nextKey = nextBody?.sourceRecordKey || nextBody?.sourceCardFingerprint || '';
     const changed = previousKey !== nextKey || JSON.stringify(data.lives || []) !== JSON.stringify(nextLives);
-    if (!changed) return { changed: false, cleared: false, restored: false };
+    if (!changed) {
+        if (remembered) saveChatMetadata();
+        return { changed: false, cleared: false, restored: false };
+    }
 
     backupLedger(data, reason);
     data.currentBody = nextBody;
     data.lives = nextLives;
+    if (record?.recoveredFromTrustedBackup) {
+        data.lastTrustedRecovery = {
+            at: new Date().toISOString(),
+            recordKey: nextBody?.sourceRecordKey || '',
+            name: nextBody?.profile?.姓名 || '',
+            reason: '旧楼层缺少可见状态快照，已用完整人物卡、精确确认口令、提交补丁、可信记录与当前身体状态自动恢复',
+        };
+    }
     if (force) data.suppressedRecordKeys = [];
     saveChatMetadata();
     return { changed: true, cleared: Boolean(previous && !nextBody), restored: Boolean(nextBody), previous, current: nextBody };
@@ -1214,6 +1266,10 @@ async function render() {
     if (!Object.keys(asObject(statData)).length) {
         panel.append(el('div', 'llm-warning', '没有检测到 stat_data；无法核实换身提交，暂停候选接管与归档。旧账本迁移备份随导出保留。'));
     }
+    const recovery = chatData(false)?.lastTrustedRecovery;
+    if (currentImportedBody() && recovery?.recordKey === currentImportedBody()?.sourceRecordKey) {
+        panel.append(el('div', 'llm-injection-receipt', `已自动恢复可信档案：${recovery.name || '当前身体'}。旧楼层快照不完整时将继续使用原人物卡、确认记录和当前状态交叉核对，不会再直接清空。`));
+    }
     if (sync) {
         const hasBody = Boolean(currentImportedBody());
         sync.textContent = hasBody ? (runtimeInfo.appliedOperations ? '正文已追踪' : '已同步') : '等待人物卡';
@@ -1249,6 +1305,9 @@ function installCardButtons() {
 function scheduleRefresh(reason = '正文楼层变化') {
     const result = reconcileConversation({ reason });
     if (result.cleared) notify('info', '相关人物卡或确认楼层已不存在，插件已撤销旧身体、历代记录和 AI 注入');
+    if (result.restored && result.current?.sourceRecordKey && result.current?.sourceRecordKey !== result.previous?.sourceRecordKey) {
+        notify('success', `已自动恢复可信身体档案：${result.current.profile?.姓名 || '当前身体'}`);
+    }
     refreshTimers.forEach(clearTimeout);
     refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(async () => {
         await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
@@ -1288,7 +1347,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.9.2 已加载');
+    console.log('[历代人生管理器] v0.9.3 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
