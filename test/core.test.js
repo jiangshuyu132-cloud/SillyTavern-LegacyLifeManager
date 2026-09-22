@@ -6,6 +6,7 @@ import {
     asObject,
     buildLifeRecord,
     carrierBackgroundStory,
+    carrierCardsFromMessage,
     carrierGeneration,
     carrierCardSections,
     carrierCardText,
@@ -275,6 +276,24 @@ test('parseCarrierCard reads the HTML carrier format used by the story', () => {
         地点: '铁炉堡工匠区裁缝铺二楼',
         伤病与健康: '身体健康，无伤病。',
     });
+});
+
+test('人物卡可从当前滑动版本和推理兼容字段读取且自动去重', () => {
+    const card = '【当前载体人物设定开始】\n<b>姓名：</b>芙莉莲<br><b>种族：</b>高等精灵<br><b>职业：</b>法师\n【当前载体人物设定结束】';
+    const message = {
+        mes: '当前可见正文未携带人物卡',
+        swipe_id: 1,
+        swipes: ['旧滑动', card],
+        extra: { reasoning: card },
+    };
+    const cards = carrierCardsFromMessage(message);
+    assert.equal(cards.length, 1);
+    assert.equal(parseCarrierCard(cards[0]).姓名, '芙莉莲');
+    const messages = confirmedFixture();
+    messages[0].swipes = [messages[0].mes];
+    messages[0].swipe_id = 0;
+    messages[0].mes = '酒馆运行时未在 mes 暴露旧人物卡';
+    assert.equal(confirmedCarrierRecords(messages)[0]?.profile?.姓名, '若莎·阿泽恩（Zhosha Adzern）');
 });
 
 test('confirmedCarrierProfile uses only the latest card followed by exact confirmation', () => {

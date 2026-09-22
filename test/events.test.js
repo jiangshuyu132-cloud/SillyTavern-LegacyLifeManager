@@ -98,7 +98,7 @@ test('生成前把正文最新身体变化实际写入AI上下文，未确认身
  assert.match(injectedPrompt,/左臂割伤/);
  assert.doesNotMatch(injectedPrompt,/候选身体/);
 });
-test('刷新时用可信备份恢复缺少提交层快照的有效换身，删除确认层仍撤销',()=>{
+test('刷新时用可信备份恢复缺少提交层快照；暂时读不到确认层不会自动清空',()=>{
  const after=setup();plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;
  data.backups=[{at:new Date().toISOString(),reason:'测试安全备份',currentBody:structuredClone(data.currentBody),lives:structuredClone(data.lives)}];data.currentBody=null;data.lives=[];
  const waiting={阶段:'等待确认',当前世代编号:1,当前身体死亡已确认:true,当前身体死亡信息:'已死亡',待确认人物卡:'【候选】新身体。详细设定见正文候选卡。',待归档人生词条:'',归档写入状态:'无待处理'};
@@ -107,5 +107,17 @@ test('刷新时用可信备份恢复缺少提交层快照的有效换身，删�
  delete ctx.chat[2].stat_data;ctx.chat[2].mes=`<UpdateVariable><JSONPatch>${JSON.stringify([{op:'replace',path:'/主角/换身状态',value:active},{op:'replace',path:'/主角/载体档案',value:{姓名:'新身体'}},{op:'insert',path:'/历代记忆摘要/-',value:{世代编号:1,身体姓名:'旧身体',详细词条名称:'第1世·旧身体'}}])}</JSONPatch></UpdateVariable>`;
  ctx.chat.push({is_user:true,mes:'继续生活'},{is_user:false,mes:'后续正文',stat_data:{主角:{载体档案:{姓名:'新身体'},生命值:{当前:100}}}});
  const restored=plugin.reconcileConversation();assert.equal(restored.current.profile.姓名,'新身体');assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
- ctx.chat.splice(1,1);const cleared=plugin.reconcileConversation();assert.equal(cleared.cleared,true);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
+ ctx.chat.splice(1,1);const preserved=plugin.reconcileConversation();assert.equal(preserved.cleared,false);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
+ const cleared=plugin.reconcileConversation({force:true,reason:'手动从当前正文重建'});assert.equal(cleared.cleared,true);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
+});
+test('运行时完全隐藏旧人物卡时，用备份与两个实时身份字段恢复当前身体',()=>{
+ setup();plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;
+ const body=structuredClone(data.currentBody);body.profile={...body.profile,种族:'高等精灵',职业:'法师'};
+ data.backups=[{at:new Date().toISOString(),reason:'误清空前自动备份',currentBody:body,lives:structuredClone(data.lives)}];
+ data.currentBody=null;data.lives=[];
+ ctx.chat=[{is_user:false,mes:'普通正文，无人物卡字段',stat_data:{主角:{种族:'高等精灵',职业:'法师',生命值:{当前:535,上限:535}}}}];
+ const restored=plugin.reconcileConversation();
+ assert.equal(restored.restored,true);
+ assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
+ assert.match(ctx.chatMetadata.legacy_life_manager.lastTrustedRecovery.reason,/至少两个稳定字段/);
 });

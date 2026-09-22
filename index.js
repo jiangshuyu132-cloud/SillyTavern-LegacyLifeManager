@@ -6,10 +6,12 @@ import {
     asObject,
     buildLifeRecord,
     carrierBackgroundStory,
+    carrierCardsFromMessage,
     carrierGeneration,
     carrierCardSections,
     carrierCardText,
     carrierRecordKey,
+    carrierProfileMatchesCurrentState,
     compactLifeIndex,
     confirmedCarrierProfile,
     confirmedCarrierRecords,
@@ -18,7 +20,6 @@ import {
     currentBehaviorProfile,
     currentBodySummary,
     detectCarryover,
-    extractCarrierCards,
     getPath,
     inferredLivesFromCarrierCard,
     isSafeRuntimePatch,
@@ -41,12 +42,13 @@ import { createMvuAdapter } from './mvu-adapter.js';
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 10, injectionMode: 'strict' });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 11, injectionMode: 'strict' });
+const RUNTIME_TOKEN = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 let initialized = false;
 let archiveInFlight = false;
 let moneyInheritanceInFlight = false;
 let refreshTimers = [];
-let lastNotification = { key: '', at: 0 };
+const sharedRuntime = globalThis.__legacyLifeManagerRuntime ??= { notification: { key: '', at: 0 }, token: '' };
 let lastPromptText = '';
 let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'strict', effectiveMode: '等待当前身体', injected: false, sourceFloor: 0, appliedOperations: 0 };
 let floatingPanelHome = null;
@@ -85,6 +87,10 @@ function settings() {
         current.dataVersion = 10;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 11) {
+        current.dataVersion = 11;
+        ctx.saveSettingsDebounced?.();
+    }
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
     return current;
 }
@@ -93,7 +99,7 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 10, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 11, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
@@ -104,7 +110,7 @@ function chatData(create = true) {
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 10;
+        data.version = 11;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -128,7 +134,7 @@ function chatData(create = true) {
             if (recordKey && receipt?.status === 'applied') trustedKeys.add(recordKey);
         }
         data.trustedCarrierRecordKeys = [...trustedKeys].slice(-50);
-        if (previousVersion < 10 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
+        if (previousVersion < 11 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
             ctx.saveMetadataDebounced?.();
         }
     }
@@ -138,8 +144,8 @@ function chatData(create = true) {
 function notify(level, message) {
     const key = `${level}:${message}`;
     const now = Date.now();
-    if (lastNotification.key === key && now - lastNotification.at < 1500) return;
-    lastNotification = { key, at: now };
+    if (sharedRuntime.notification.key === key && now - sharedRuntime.notification.at < 5000) return;
+    sharedRuntime.notification = { key, at: now };
     if (globalThis.toastr?.[level]) globalThis.toastr[level](message, '历代人生管理器');
     else console[level === 'error' ? 'error' : 'log'](`[历代人生管理器] ${message}`);
 }
@@ -267,6 +273,24 @@ function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
     };
 }
 
+function recoverableSavedLedger(data, currentState) {
+    const candidates = [
+        ...(data?.backups || []).slice().reverse().map(item => ({ body: item?.currentBody, lives: item?.lives || [] })),
+        { body: data?.legacyMigrationBackup?.data?.currentBody, lives: data?.legacyMigrationBackup?.data?.lives || [] },
+    ];
+    for (const candidate of candidates) {
+        const body = candidate.body;
+        if (!body?.rawCard || !Object.keys(asObject(body.profile)).length) continue;
+        if (body.confirmed === false || (body.sourceType && body.sourceType !== 'conversation')) continue;
+        if (!carrierProfileMatchesCurrentState(currentState, body.profile, 2)) continue;
+        return {
+            body: structuredClone(body),
+            lives: structuredClone(candidate.lives || []),
+        };
+    }
+    return null;
+}
+
 function reconcileConversation({ force = false, reason = '自动对账' } = {}) {
     const data = chatData();
     const messages = protocolMessages();
@@ -276,6 +300,23 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
     const previous = data.currentBody;
     let nextLives = truth.lives;
     let nextBody = record ? bodyFromConfirmedRecord(record, messages, nextLives, previous) : null;
+    let savedRecovery = null;
+    if (!record && !force) {
+        // A normal page refresh is not proof that the source was deleted.
+        // Long imported chats can expose only the active swipe or omit older
+        // message bodies while they are still loading. Never destroy a body
+        // already confirmed by this plugin merely because one scan is empty.
+        if (previous?.rawCard && previous?.profile) {
+            nextBody = previous;
+            nextLives = data.lives || [];
+        } else {
+            savedRecovery = recoverableSavedLedger(data, trustedCarrierOptions(data).currentState);
+            if (savedRecovery) {
+                nextBody = savedRecovery.body;
+                nextLives = mergeLifeRecords(savedRecovery.lives, data.lives || []);
+            }
+        }
+    }
     const remembered = record ? rememberTrustedCarrierRecord(data, record, messages) : false;
 
     const previousKey = previous?.sourceRecordKey || previous?.sourceCardFingerprint
@@ -290,7 +331,14 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
     backupLedger(data, reason);
     data.currentBody = nextBody;
     data.lives = nextLives;
-    if (record?.recoveredFromTrustedBackup || record?.recoveredFromVerifiedLegacyChain) {
+    if (savedRecovery) {
+        data.lastTrustedRecovery = {
+            at: new Date().toISOString(),
+            recordKey: nextBody?.sourceRecordKey || nextBody?.sourceCardFingerprint || '',
+            name: nextBody?.profile?.姓名 || '',
+            reason: '酒馆运行时暂未暴露旧人物卡正文；已用插件安全备份与当前身体的至少两个稳定字段交叉核对后恢复',
+        };
+    } else if (record?.recoveredFromTrustedBackup || record?.recoveredFromVerifiedLegacyChain) {
         const usedLegacyChain = record.recoveredFromVerifiedLegacyChain === true;
         data.lastTrustedRecovery = {
             at: new Date().toISOString(),
@@ -665,7 +713,7 @@ function availableCarrierCards() {
     const result = [];
     for (const [messageIndex, message] of (protocolMessages()).entries()) {
         if (!message || message.is_user || message.is_system) continue;
-        const cards = extractCarrierCards(message.mes);
+        const cards = carrierCardsFromMessage(message);
         for (const [cardIndex, card] of cards.entries()) {
             const profile = parseCarrierCard(card);
             if (profile.姓名) result.push({ messageIndex, cardIndex, card, profile });
@@ -1296,7 +1344,7 @@ function installCardButtons() {
     for (const message of document.querySelectorAll('#chat .mes[mesid], #chat .mes[data-message-id]')) {
         const messageIndex = Number(message.getAttribute('mesid') ?? message.dataset.messageId);
         if (!Number.isFinite(messageIndex) || message.querySelector('.llm-card-actions')) continue;
-        const cards = extractCarrierCards(ctx.chat[messageIndex]?.mes);
+        const cards = carrierCardsFromMessage(ctx.chat[messageIndex]);
         const card = cards.at(-1);
         const profile = parseCarrierCard(card);
         if (!profile.姓名) continue;
@@ -1328,10 +1376,14 @@ function registerEvents() {
     const ctx = context();
     if (!ctx?.eventSource || !ctx?.eventTypes) return;
     for (const type of ['CHAT_CHANGED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
-        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => scheduleRefresh(type));
+        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => {
+            if (sharedRuntime.token === RUNTIME_TOKEN) scheduleRefresh(type);
+        });
     }
     for (const type of ['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS']) {
-        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], updateCurrentBodyPrompt);
+        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => {
+            if (sharedRuntime.token === RUNTIME_TOKEN) updateCurrentBodyPrompt();
+        });
     }
 }
 
@@ -1342,6 +1394,7 @@ export async function init() {
     const mount = document.querySelector('#extensions_settings2, #extensions_settings');
     if (!mount) return console.error('[历代人生管理器] 找不到扩展设置面板');
     initialized = true;
+    sharedRuntime.token = RUNTIME_TOKEN;
     settings();
     if (!document.getElementById('legacy-life-manager-root')) mount.append(createPanel());
     ensureFloatingLauncher();
@@ -1354,7 +1407,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.9.4 已加载');
+    console.log('[历代人生管理器] v0.9.5 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

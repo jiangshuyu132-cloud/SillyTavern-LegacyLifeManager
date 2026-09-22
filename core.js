@@ -575,6 +575,48 @@ export function extractCarrierCards(text) {
         .filter(Boolean);
 }
 
+/**
+ * SillyTavern does not always keep an older assistant reply in `mes` while a
+ * chat is open.  Depending on the active swipe, extension stack and import
+ * path, the same visible reply can live in `swipes`, `extra.reasoning` or one
+ * of the compatibility fields below.  Treat those fields as alternate views
+ * of the same message; never treat duplicate copies as separate cards.
+ */
+export function messageTextVariants(message = {}) {
+    const values = [];
+    const add = value => {
+        if (typeof value === 'string' && value.trim()) values.push(value);
+        else if (value && typeof value === 'object' && typeof value.mes === 'string') values.push(value.mes);
+    };
+    add(message.mes);
+    const swipes = Array.isArray(message.swipes) ? message.swipes : [];
+    const activeSwipe = Number(message.swipe_id);
+    if (Number.isInteger(activeSwipe) && activeSwipe >= 0) add(swipes[activeSwipe]);
+    for (const swipe of swipes) add(swipe);
+    add(message.original_mes);
+    add(message.reasoning);
+    add(message.extra?.original_mes);
+    add(message.extra?.display_text);
+    add(message.extra?.reasoning);
+    add(message.data?.mes);
+    return [...new Set(values)];
+}
+
+export function carrierCardsFromMessage(message = {}) {
+    for (const text of messageTextVariants(message)) {
+        const cards = extractCarrierCards(text);
+        if (!cards.length) continue;
+        const seen = new Set();
+        return cards.filter(card => {
+            const fingerprint = stableTextFingerprint(card);
+            if (seen.has(fingerprint)) return false;
+            seen.add(fingerprint);
+            return true;
+        });
+    }
+    return [];
+}
+
 function carrierField(card, label) {
     const escaped = String(label).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const htmlMatch = String(card || '').match(new RegExp(`<b>\\s*${escaped}\\s*[：:]\\s*</b>\\s*([\\s\\S]*?)(?=<br\\s*\\/?>|<\\/div>)`, 'i'));
@@ -612,7 +654,7 @@ export function unvalidatedCarrierRecords(messages = []) {
             const message = messages[cardIndex];
             if (message?.is_user && isCarrierConfirmation(message.mes)) break;
             if (!message || message.is_user || message.is_system) continue;
-            const cards = extractCarrierCards(message.mes);
+            const cards = carrierCardsFromMessage(message);
             const card = cards.at(-1);
             const profile = parseCarrierCard(card);
             if (!Object.keys(profile).length) continue;
@@ -679,9 +721,33 @@ function verifiedLegacyCarrierMatchesCurrentState(stat, profile = {}) {
     return matched >= 2;
 }
 
+export function carrierProfileMatchesCurrentState(stat, profile = {}, minimumMatches = 2) {
+    const main = asObject(stat?.主角);
+    const carrier = asObject(main.载体档案);
+    const hp = Number(main?.生命值?.当前);
+    if (!Object.keys(main).length || (Number.isFinite(hp) && hp <= 0)) return false;
+
+    let matched = 0;
+    for (const [stored, expected] of [
+        [carrier.姓名 || main.姓名, profile.姓名],
+        [carrier.种族 || main.种族, profile.种族],
+        [carrier.职业 || main.职业, profile.职业],
+    ]) {
+        if (!comparableCarrierValue(stored) || !comparableCarrierValue(expected)) continue;
+        if (!carrierValuesMatch(stored, expected)) return false;
+        matched += 1;
+    }
+    return matched >= Math.max(1, Number(minimumMatches) || 1);
+}
+
 export function confirmedCarrierRecords(messages = [], options = {}) {
-    const timeline = protocolTimeline(messages, {storedOnly:true});
-    const recoveredTimeline = protocolTimeline(messages, {recoverMissingProtocol:true});
+    const protocolMessages = messages.map(message => {
+        if (!message || message.is_user || message.is_system || extractCarrierCards(message.mes).length) return message;
+        const compatibleText = messageTextVariants(message).find(text => extractCarrierCards(text).length);
+        return compatibleText ? { ...message, mes: compatibleText } : message;
+    });
+    const timeline = protocolTimeline(protocolMessages, {storedOnly:true});
+    const recoveredTimeline = protocolTimeline(protocolMessages, {recoverMissingProtocol:true});
     const trustedRecordKeys = new Set(options?.trustedRecordKeys || []);
     // In a live SillyTavern session the current MVU value can be available
     // through the public variable API even when old message objects do not
@@ -692,24 +758,24 @@ export function confirmedCarrierRecords(messages = [], options = {}) {
         ? suppliedCurrentState
         : (timeline.at(-1) || {});
     const accepted = [], consumed = new Set();
-    for (const item of unvalidatedCarrierRecords(messages)) {
-        if (isDiscussion(messages[item.cardIndex]) || isDiscussion(messages[item.confirmationIndex])) continue;
+    for (const item of unvalidatedCarrierRecords(protocolMessages)) {
+        if (isDiscussion(protocolMessages[item.cardIndex]) || isDiscussion(protocolMessages[item.confirmationIndex])) continue;
         const generation = carrierGeneration(item.card, 0);
         if (!generation || consumed.has(generation)) continue;
         let before = timeline[item.confirmationIndex - 1] || {};
         let recovery = false;
-        if (!confirmationGate(before, messages[item.confirmationIndex]?.mes, item.card)) {
+        if (!confirmationGate(before, protocolMessages[item.confirmationIndex]?.mes, item.card)) {
             before = recoveredTimeline[item.confirmationIndex - 1] || {};
-            recovery = confirmationGate(before, messages[item.confirmationIndex]?.mes, item.card)
-                || schemaStrippedConfirmationGate(before, messages[item.confirmationIndex]?.mes, item.profile, generation);
+            recovery = confirmationGate(before, protocolMessages[item.confirmationIndex]?.mes, item.card)
+                || schemaStrippedConfirmationGate(before, protocolMessages[item.confirmationIndex]?.mes, item.profile, generation);
             if (!recovery) continue;
         }
         let committed = false;
-        for (let i=item.confirmationIndex+1; i<messages.length; i++) {
-            if (messages[i]?.is_user && !messages[i].is_system) break;
-            if (messages[i]?.is_system || isDiscussion(messages[i])) continue;
+        for (let i=item.confirmationIndex+1; i<protocolMessages.length; i++) {
+            if (protocolMessages[i]?.is_user && !protocolMessages[i].is_system) break;
+            if (protocolMessages[i]?.is_system || isDiscussion(protocolMessages[i])) continue;
             const after = recovery ? recoveredTimeline[i] : timeline[i];
-            const recordKey = carrierRecordKey(item, messages);
+            const recordKey = carrierRecordKey(item, protocolMessages);
             const trustedBackupEvidence = recovery
                 && trustedRecordKeys.has(recordKey)
                 && trustedCarrierMatchesCurrentState(currentStoredState, item.profile);
@@ -718,7 +784,7 @@ export function confirmedCarrierRecords(messages = [], options = {}) {
                 && Object.keys(suppliedCurrentState).length > 0
                 && verifiedLegacyCarrierMatchesCurrentState(suppliedCurrentState, item.profile);
             const storedEvidence = !recovery
-                || schemaStrippedCommitEvidence(messages,item.cardIndex,i,item.profile)
+                || schemaStrippedCommitEvidence(protocolMessages,item.cardIndex,i,item.profile)
                 || trustedBackupEvidence
                 || verifiedLegacyEvidence;
             if (storedEvidence && commitGate(before,after,item.profile,generation)) {
