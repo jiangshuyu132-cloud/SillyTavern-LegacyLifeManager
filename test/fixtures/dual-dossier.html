@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>双档案界面回归样例</title>
+<link rel="stylesheet" href="/style.css">
+<style>body{margin:0;padding:24px;background:#15171e;color:#eee;font:16px system-ui}#extensions_settings2{max-width:980px;margin:auto}button{font:inherit}*{box-sizing:border-box}</style>
+<div id="extensions_settings2"></div><div id="chat"></div>
+<script type="module">
+import {carrierCardSections} from '/core.js';
+import {dossierBodyId} from '/dossier.js';
+const text=`— 当前形态基础 —
+姓名：林晓
+年龄：28
+种族：人类
+职业：画师
+— 外貌详述 —
+头发：黑色长发，发尾微卷。
+面容：自然肤色，左眉有一颗小痣。
+妆容：无
+— 声音特征 —
+音色：清亮
+— 气味特征 —
+自然体味：淡淡皂香
+— 卫生状况 —
+全身卫生：干净
+— 当前穿着 —
+上衣：灰色棉衫
+鞋子：黑色短靴
+— 人生背景 —
+出生与家庭：出生在河畔小城。
+成长经历：成年后学习绘画。`;
+const body={rawCard:text,text,sections:carrierCardSections(text),profile:{姓名:'林晓',种族:'人类',职业:'画师',年龄:'28'},generation:2,confirmationMessageIndex:-1,confirmed:true,sourceType:'conversation',sourceRecordKey:'qa-confirmed'};
+const stat={主角:{姓名:'林晓',种族:'人类',职业:'画师',生命值:{当前:100,上限:100},状态效果:{},金钱:250}};
+const changes=[{op:'set',section:'外貌详述',field:'妆容',value:'淡红唇色，细眼线。自然五官不变。',evidence:'她化好淡红唇妆和细眼线，换上了蓝色外套。'},{op:'set',section:'当前穿着',field:'上衣',value:'蓝色外套',evidence:'她化好淡红唇妆和细眼线，换上了蓝色外套。'}];
+const callbacks={};
+const eventTypes=Object.fromEntries(['CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_EDITED','MESSAGE_SWIPED','MESSAGE_DELETED','GENERATION_STARTED','GENERATION_AFTER_COMMANDS'].map(x=>[x,x]));
+globalThis.qaContext={chatId:'qa-only',chat:[{is_user:false,send_date:'qa-1',mes:'<gametxt>她化好淡红唇妆和细眼线，换上了蓝色外套。</gametxt><LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes})+'</LegacyBodyUpdate>',stat_data:stat},{is_user:true,mes:'继续散步'}],chatMetadata:{legacy_life_manager:{version:13,protocolVersion:'dusk.1',currentBody:body,lives:[],backups:[]}},extensionSettings:{},extensionPrompts:{},eventTypes,eventSource:{on(type,callback){(callbacks[type]??=[]).push(callback);}},async setExtensionPrompt(key,value){this.extensionPrompts[key]={value};},saveMetadataDebounced(){},saveSettingsDebounced(){},getWorldInfoNames(){return [];}};
+globalThis.SillyTavern={getContext:()=>qaContext};
+globalThis.getVariables=()=>({stat_data:stat});
+globalThis.toastr={info:console.log,warning:console.warn,error:console.error,success:console.log};
+await import('/index.js');
+</script></html>

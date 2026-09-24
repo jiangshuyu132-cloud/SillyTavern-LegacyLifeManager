@@ -490,6 +490,10 @@
 }
 
 .llm-life-title { color: var(--llm-accent-bright); font-size: 1rem; font-weight: 600; }
+.llm-original-dossier { margin-top: 1.5rem; padding: 1rem; border: 1px dashed var(--llm-border-strong); border-radius: 14px; }
+.llm-original-dossier > summary { cursor: pointer; color: var(--llm-gold); font-weight: 600; }
+.llm-original-dossier[open] > .llm-muted { margin: 1rem 0; }
+.llm-dossier-source { padding: 0.65rem 1rem; color: var(--llm-accent-bright); font-size: 0.8rem; border-top: 1px solid var(--llm-border); }
 .llm-life-summary { margin: 0; color: #c7cad4; line-height: 1.7; white-space: pre-wrap; }
 .llm-label, .llm-control-card { display: grid; padding: 0.9rem; gap: 0.5rem; color: #dedfe7; font-size: 0.86rem; font-weight: 500; }
 #legacy-life-manager-root .text_pole { min-height: 42px; border: 1px solid var(--llm-border); border-radius: 9px; background: rgb(8 11 17 / 58%); color: #dde0e8; }

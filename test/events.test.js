@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {dossierBodyId} from '../dossier.js';
+import {carrierCardSections} from '../core.js';
 let ctx,book,saveCount,fetchCount,readbackOK=true,changeDuringRead=false,injectedPrompt='';
 globalThis.document={readyState:'loading',addEventListener(){},getElementById(){return null;},querySelector(){return null;}};
 globalThis.SillyTavern={getContext:()=>ctx};
@@ -9,7 +11,7 @@ globalThis.confirm=()=>true;
 globalThis.getVariables=opts=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;return {stat_data:ctx.chat[index]?.stat_data};};
 globalThis.updateVariablesWith=(fn,opts)=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;const next=fn({stat_data:ctx.chat[index].stat_data});ctx.chat[index].stat_data=next.stat_data;};
 globalThis.fetch=async()=>{fetchCount++;if(changeDuringRead)ctx.chatId='different-chat';return {ok:readbackOK,async json(){return structuredClone(book);}};};
-const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance,updateCurrentBodyPrompt,backupDigest,importBackupPayload};';
+const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance,updateCurrentBodyPrompt,backupDigest,importBackupPayload,renderFullBody};';
 const plugin=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const card='【当前载体人物设定开始】\n<div><b>世代编号：</b>第2世<br><b>姓名：</b>新身体<br></div>\n【当前载体人物设定结束】';
 const draft='词条名称: 第1世·旧身体\n重要人物: 守卫\n重要经历：守住城门。';
@@ -172,4 +174,59 @@ test('运行时完全隐藏旧人物卡时，用备份与两个实时身份字�
  assert.equal(restored.restored,true);
  assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
  assert.match(ctx.chatMetadata.legacy_life_manager.lastTrustedRecovery.reason,/至少两个稳定字段/);
+});
+
+test('完整动态档实际写入扩展提示；后续轮次、隐藏楼层和导入备份仍包含变化',async()=>{
+ const after=setup();plugin.reconcileConversation();
+ const data=ctx.chatMetadata.legacy_life_manager;
+ const text='— 当前形态基础 —\n姓名：新身体\n种族：人类\n职业：画师\n— 外貌详述 —\n头发：黑色长发\n面容：左眉有痣\n妆容：无\n— 当前穿着 —\n上衣：白色棉衫\n鞋子：短靴';
+ Object.assign(data.currentBody,{rawCard:text,text,sections:carrierCardSections(text),profile:{姓名:'新身体',种族:'人类',职业:'画师'}});
+ after.主角.种族='人类';after.主角.职业='画师';
+ ctx.chat[0].mes='旧卡楼层已隐藏';
+ ctx.chat.push({is_user:true,mes:'去化妆'}, {is_user:false,send_date:'makeup-source',mes:'<gametxt>她涂好了淡红色唇膏。</gametxt><LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(data.currentBody),changes:[{op:'set',section:'外貌详述',field:'妆容',value:'淡红色唇妆',evidence:'她涂好了淡红色唇膏。'}]})+'</LegacyBodyUpdate>'});
+ ctx.extensionPrompts={};ctx.setExtensionPrompt=async(key,value)=>{injectedPrompt=value;ctx.extensionPrompts[key]={value};};
+ await plugin.updateCurrentBodyPrompt();
+ const materialized=data.currentBody.dynamicDossier;
+ assert.ok(injectedPrompt.includes(materialized.text));
+ assert.match(injectedPrompt,/妆容：淡红色唇妆/);assert.doesNotMatch(injectedPrompt,/妆容：无/);assert.match(injectedPrompt,/面容：左眉有痣/);
+ ctx.chat.at(-1).is_system=true;ctx.chat.push({is_user:true,mes:'继续散步'});
+ await plugin.updateCurrentBodyPrompt();assert.match(injectedPrompt,/淡红色唇妆/);
+ const payload={format:'sillytavern-legacy-life-backup',version:2,chatId:'test',pluginLedger:structuredClone(data),archiveEntries:[],transcript:[]};
+ const envelope={...payload,integrity:await plugin.backupDigest(payload)};
+ data.currentBody.dynamicDossier=null;ctx.chat[4].mes='正文不在运行时窗口中';
+ await plugin.importBackupPayload(envelope,{ask:false});
+ assert.match(injectedPrompt,/淡红色唇妆/);assert.match(injectedPrompt,/左眉有痣/);
+ assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.rawCard,text);
+});
+
+test('生成拦截器等待投递，实际提示区不符则终止生成，不误报成功',async()=>{
+ setup();plugin.reconcileConversation();ctx.chat.push({is_user:true,mes:'散步'});
+ let aborted=false;
+ ctx.extensionPrompts={};
+ ctx.setExtensionPrompt=async(key,value)=>{await new Promise(resolve=>setTimeout(resolve,8));injectedPrompt=value;ctx.extensionPrompts[key]={value};};
+ await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{aborted=true;},'normal');
+ assert.equal(aborted,false);assert.match(injectedPrompt,/完整动态身体档案维护协议/);
+ ctx.setExtensionPrompt=async()=>{};ctx.extensionPrompts={};
+ await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{aborted=true;},'normal');
+ assert.equal(aborted,true);
+});
+
+test('双档案界面动态板块与提示完全同源，固定原档仍单独完整展示',()=>{
+ const after=setup();ctx.chat.push({is_user:true,mes:'散步'});
+ const text='— 当前形态基础 —\n姓名：新身体\n— 外貌详述 —\n妆容：无\n面容：自然五官';
+ const body={rawCard:text,text,profile:{姓名:'新身体'},generation:2,sections:carrierCardSections(text),confirmationMessageIndex:1};
+ ctx.chat.push({mes:'她已经化好了淡妆。<LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes:[{op:'set',section:'外貌详述',field:'妆容',value:'淡妆',evidence:'她已经化好了淡妆。'}]})+'</LegacyBodyUpdate>'});
+ const prompt=plugin.buildCurrentBodyPrompt(body,after,'strict').prompt;
+ class Node {children=[];textContent='';append(...items){this.children.push(...items);} }
+ const oldCreate=globalThis.document.createElement;globalThis.document.createElement=()=>new Node();
+ try {
+  const panel=new Node();plugin.renderFullBody(panel,body,after);
+  const flatten=node=>[node.textContent,...node.children.flatMap(flatten)];
+  const strings=flatten(panel);
+  assert.ok(strings.includes('当前有效身体档案（动态主档·每轮完整注入）'));
+  assert.ok(strings.includes('接管时身体档案（固定原档·仅供回顾）'));
+  for(const section of body.dynamicDossier.sections){assert.ok(strings.includes(section.content));assert.ok(prompt.includes(section.content));}
+  assert.ok(strings.includes('妆容：无\n面容：自然五官'));
+  assert.doesNotMatch(prompt,/妆容：无/);
+ } finally {globalThis.document.createElement=oldCreate;}
 });

@@ -39,11 +39,12 @@ import {
     upsertArchive,
 } from './core.js';
 import { createMvuAdapter } from './mvu-adapter.js';
+import { resolveDynamicDossier, dossierUpdateInstructions } from './dossier.js';
 
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 12, injectionMode: 'strict', floatingPosition: null });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 13, injectionMode: 'strict', floatingPosition: null });
 const RUNTIME_TOKEN = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 let initialized = false;
 let archiveInFlight = false;
@@ -97,6 +98,11 @@ function settings() {
         current.dataVersion = 12;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 13) {
+        if (current.injectionMode !== 'off') current.injectionMode = 'strict';
+        current.dataVersion = 13;
+        ctx.saveSettingsDebounced?.();
+    }
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
     return current;
 }
@@ -105,7 +111,7 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 12, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 13, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
@@ -116,7 +122,7 @@ function chatData(create = true) {
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 12;
+        data.version = 13;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -140,7 +146,7 @@ function chatData(create = true) {
             if (recordKey && receipt?.status === 'applied') trustedKeys.add(recordKey);
         }
         data.trustedCarrierRecordKeys = [...trustedKeys].slice(-50);
-        if (previousVersion < 12 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
+        if (previousVersion < 13 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
             ctx.saveMetadataDebounced?.();
         }
     }
@@ -222,8 +228,8 @@ function backupLedger(data, reason) {
     data.backups.push({
         at: new Date().toISOString(),
         reason,
-        currentBody: data.currentBody,
-        lives: data.lives,
+        currentBody: structuredClone(data.currentBody),
+        lives: structuredClone(data.lives),
     });
     data.backups = data.backups.slice(-5);
 }
@@ -276,6 +282,7 @@ function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
         generation: carrierGeneration(record.card, Math.max(1, ...lives.map(item => Number(item.generation) + 1).filter(Number.isFinite))),
         confirmed: true,
         importedAt: previous?.sourceRecordKey === sourceRecordKey ? previous.importedAt : new Date().toISOString(),
+        ...(previous?.sourceRecordKey === sourceRecordKey && previous?.dynamicDossier ? { dynamicDossier: structuredClone(previous.dynamicDossier) } : {}),
     };
 }
 
@@ -362,6 +369,16 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
 
 function currentImportedBody() {
     return chatData(false)?.currentBody || null;
+}
+
+function effectiveDossier(body, statData, options = {}) {
+    if (!body) return null;
+    const result = resolveDynamicDossier(body, context()?.chat || [], statData, options);
+    if (result.changed) {
+        body.dynamicDossier = result.state;
+        if (body === currentImportedBody()) saveChatMetadata();
+    }
+    return result;
 }
 
 async function applyMoneyInheritance() {
@@ -506,14 +523,15 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         if (nameConflicts || (!liveName && !unnamedStateMatches)) return {prompt:'',effectiveMode:'等待MVU当前身体同步'};
     }
     const messages = protocolMessages();
-    const profile = JSON.stringify(body.profile || {}, null, 2);
     const strict = mode === 'strict';
-    const behavior = JSON.stringify(currentBehaviorProfile(body.rawCard || body.text, statData, { preferCard: strict }), null, 2);
+    const dossier = effectiveDossier(body, statData);
+    const behavior = JSON.stringify(currentBehaviorProfile(dossier.text, statData, { preferCard: true }), null, 2);
     const firstSmartTurn = mode === 'smart' && smartInjectionUsesFullCard(body, messages);
-    const useFullCard = strict || mode === 'full' || firstSmartTurn;
-    const details = useFullCard ? body.text : profile;
-    const detailTitle = useFullCard ? '完整当前身体档案' : '当前身体核心档案';
-    const backgroundStory = String(body.backgroundStory || carrierBackgroundStory(body.rawCard || body.text) || '').trim();
+    // All enabled modes send the full current dossier. A compact initial card
+    // cannot faithfully represent a body after many independent changes.
+    const details = dossier.text;
+    const detailTitle = '当前有效身体档案（动态主档·完整）';
+    const backgroundStory = String(carrierBackgroundStory(dossier.text) || body.backgroundStory || '').trim();
     const backgroundSection = backgroundStory
         ? `\n\n【当前身体人生背景｜出生至接管年龄｜每轮有效】\n这是当前原主在接管前真实经历的人生连续史，用于约束其记忆、关系、知识来源、习惯、创伤、能力来源与当前处境。不得把它误当成前世经历，也不得用历代旧人格或旧技能补写空白。正文后来明确发生的新经历可以继续发展，但不得无故重写已经确认的出生与成长事实。\n${backgroundStory}`
         : '';
@@ -525,10 +543,11 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         : '';
     const effectiveMode = strict ? '严格主档案·每轮完整'
         : mode === 'smart'
-        ? (firstSmartTurn ? '智能·换身首轮完整' : '智能·日常精简')
-        : mode === 'full' ? '完整' : '精简';
+        ? '兼容智能·动态主档完整'
+        : mode === 'full' ? '动态主档完整' : '兼容精简·动态主档完整';
     const authorityRules = `【资料来源合并与优先级｜每轮强制执行】
 - 必须同时读取本插件档案与正文已有的 <status_current_variables>/stat_data；“插件档案优先”不表示关闭、忽略或删除正文角色面板。
+- 下方主档是已合并正文变化的当前身体，不是接管快照。已消失的妆容、换下的衣物、治愈的疾病不得从旧楼层重新带回；固定原档仅在插件界面留作历史回顾，不重复作为当前设定发送。
 - 对姓名、种族、身份背景、从出生到接管年龄的人生背景、外貌、声音、气味、身体结构、卫生、长期疾病的完整表现、性格、记忆、认知、感情、习惯、知识语言及其它详细人物设定，本插件的已确认完整档案是主档案。同名正文变量若更短、更概括或缺字段，只能作为实时补充，不得缩写、抹除、降格或覆盖插件细节。
 - 对世界时间、当前地点、生命/法力/体力、等级属性、金钱、物品数量、背包、装备、资产、任务、新闻、地图、人物是否在场、好感度、当前想法，以及正文中新发生并已写入变量的获得、消耗、损坏、治愈、移除、恶化等动态事实，以最新 stat_data 为准。
 - 状态效果必须合并：stat_data 决定当前是否存在、层数、剩余时间与即时严重度；插件档案提供完整症状、身体表现、长期影响与叙事细节。简短状态条不得覆盖详细档案；变量明确治愈或移除后也不得因旧档案继续视为仍生效。正文新增而插件原卡没有的状态必须接受。
@@ -541,7 +560,8 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         .replace('<legacy_life_current_body>', '<legacy_life_current_body authority="confirmed-plugin-dossier-first">')
         .replace('\n\n【行动—人格协调规则', `\n\n${authorityRules}\n\n【行动—人格协调规则`);
     const guardedPrompt = authoritativePrompt.replace('\n\n【行动—人格协调规则', `\n\n${moneyRule}\n\n【行动—人格协调规则`);
-    return { prompt: guardedPrompt, effectiveMode };
+    const finalPrompt = guardedPrompt.replace('</legacy_life_current_body>', `\n\n${dossierUpdateInstructions(body, dossier)}\n</legacy_life_current_body>`);
+    return { prompt: finalPrompt, effectiveMode };
 }
 
 function recordPromptStats(prompt, requestedMode, effectiveMode, runtimeInfo = {}, injected = true) {
@@ -565,22 +585,44 @@ function promptStatsText() {
     const stats = lastPromptStats;
     const source = stats.sourceFloor > 0 ? ` · 正文截至第 ${stats.sourceFloor} 楼` : '';
     const live = stats.appliedOperations ? ` · 含 ${stats.appliedOperations} 项待落盘变化` : '';
-    const state = stats.injected ? '已写入 AI 上下文' : '当前未注入';
+    const state = stats.injected ? '已写入酒馆提示区（生成时使用）' : '当前未注入';
     return `${state}：${stats.effectiveMode} · ${stats.characters.toLocaleString()} 字符 · 约 ${stats.tokenLow.toLocaleString()}–${stats.tokenHigh.toLocaleString()} Token${source}${live}`;
 }
 
 async function updateCurrentBodyPrompt() {
     const ctx = context();
-    if (typeof ctx?.setExtensionPrompt !== 'function') return;
+    if (typeof ctx?.setExtensionPrompt !== 'function') throw new Error('酒馆未提供扩展提示接口，无法投递动态主档');
     reconcileConversation({ reason: '生成前校验' });
     const runtimeInfo = readEffectiveStatData();
     const { statData } = runtimeInfo;
     const requestedMode = settings().injectionMode || 'strict';
     const built = buildCurrentBodyPrompt(currentImportedBody(), statData, requestedMode);
-    await ctx.setExtensionPrompt(PROMPT_KEY, built.prompt, 1, 0, false, 0);
+    try {
+        await ctx.setExtensionPrompt(PROMPT_KEY, built.prompt, 1, 0, false, 0);
+        if (ctx.extensionPrompts && ctx.extensionPrompts[PROMPT_KEY]?.value !== built.prompt) throw new Error('酒馆提示区回读内容不一致');
+    } catch (error) {
+        recordPromptStats('', requestedMode, '投递失败', runtimeInfo, false);
+        throw error;
+    }
     lastPromptText = built.prompt;
     recordPromptStats(built.prompt, requestedMode, built.effectiveMode, runtimeInfo, true);
 }
+
+// SillyTavern awaits this AFTER adding the new user message and BEFORE building
+// the outgoing prompt. Early UI events alone can still see the previous turn.
+globalThis.legacyLifeManagerGenerationInterceptor = async (_chat, _size, abort, type) => {
+    if (sharedRuntime.token && sharedRuntime.token !== RUNTIME_TOKEN) return;
+    try {
+        if (['quiet', 'impersonate'].includes(type)) {
+            await context()?.setExtensionPrompt?.(PROMPT_KEY, '', 1, 0, false, 0);
+            return;
+        }
+        await updateCurrentBodyPrompt();
+    } catch (error) {
+        notify('error', `动态主档投递失败，已暂停本次生成：${error.message}`);
+        abort?.(true);
+    }
+};
 
 function currentWorldBookName() {
     const ctx = context();
@@ -724,13 +766,15 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
 
     const current = chatData();
     const before = structuredClone(current);
-    const beforeSettings = structuredClone(settings());
+    const beforeSettings = structuredClone(ctx.extensionSettings[EXTENSION_KEY] || DEFAULT_SETTINGS);
+    const beforePrompt = lastPromptText;
+    const beforeStats = structuredClone(lastPromptStats);
     const liveState = readEffectiveStatData().statData || readStatData() || {};
     const canActivate = Boolean(importedBody && carrierProfileMatchesCurrentState(liveState, importedBody.profile, 2));
     const importedBackups = Array.isArray(importedLedger.backups) ? importedLedger.backups : [];
     const restorePoint = { at: new Date().toISOString(), reason: '导入外部备份前自动保存', currentBody: before.currentBody, lives: before.lives || [] };
 
-    current.version = 12;
+    current.version = 13;
     current.protocolVersion = 'dusk.1';
     current.lives = mergeLifeRecords(current.lives || [], importedLives);
     current.backups = [...(current.backups || []), restorePoint, ...structuredClone(importedBackups)].slice(-12);
@@ -793,7 +837,9 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
         ctx.extensionSettings[EXTENSION_KEY] = beforeSettings;
         saveChatMetadata();
         saveSettings();
-        await updateCurrentBodyPrompt().catch(() => {});
+        try { await ctx.setExtensionPrompt?.(PROMPT_KEY, beforePrompt, 1, 0, false, 0); } catch { /* original error is reported below */ }
+        lastPromptText = beforePrompt;
+        lastPromptStats = beforeStats;
         throw new Error(`导入已回滚：${error.message}`);
     }
     await render();
@@ -821,6 +867,7 @@ async function chooseBackupImport() {
 async function exportBackup() {
     const ctx = context();
     const { statData } = readEffectiveStatData();
+    effectiveDossier(currentImportedBody(), statData);
     const name = currentWorldBookName();
     const book = name ? await ctx?.loadWorldInfo?.(name) : null;
     const transcript = (ctx?.chat || []).map((message, index) => ({
@@ -930,27 +977,42 @@ async function clearCurrentChatLedger() {
     notify('success', '已清空本聊天的插件记录和 AI 当前身体注入');
 }
 
-function renderFullBody(panel, body) {
+function renderFullBody(panel, body, statData) {
     if (!body?.text) return;
-    const heading = el('h3', 'llm-section-title', '当前有效身体档案（每轮发送给 AI）');
-    const intro = el('div', 'llm-muted', '下列折叠项保留接管时的详细基础设定；上方“当前有效动态覆盖”会随正文更新并在同一轮提示中覆盖旧伤势、疾病状态、卫生、穿着、形态和改造。界面显示与 AI 实际接收使用同一份合并数据。');
+    const dossier = effectiveDossier(body, statData);
+    const heading = el('h3', 'llm-section-title', '当前有效身体档案（动态主档·每轮完整注入）');
+    const intro = el('div', 'llm-muted', '完整复制接管原档后持续更新。化妆、卸妆、换衣、身体与认知变化会写进对应板块；没有变化的细节保留。每轮提示使用下方同一份完整主档。');
     const sections = el('div', 'llm-sections');
-    for (const section of body.sections || carrierCardSections(body.rawCard)) {
-        if (/^(?:人生背景|背景故事|生平经历|成长经历)$/.test(String(section.title || '').trim())) continue;
+    for (const section of dossier.sections) {
         const details = document.createElement('details');
         details.className = 'llm-life llm-section';
         details.append(el('summary', '', section.title), el('div', 'llm-section-content', section.content));
+        if (section.changed) details.append(el('div', 'llm-dossier-source', `已更新 · ${section.sources.join('、')}`));
         sections.append(details);
+    }
+    panel.append(heading, intro);
+    if (dossier.state.pending) panel.append(el('div', 'llm-warning', `第 ${dossier.state.pending.sourceIndex} 楼尚未完成动态档案核对，下一次普通回复将携带补齐要求。原文仍保留；如该楼存在身体变化，目前不能宣称已保存。`));
+    for (const issue of dossier.state.issues) panel.append(el('div', 'llm-warning', `动态档案未接收：${issue}。下一轮会要求模型按协议重新输出。`));
+    panel.append(sections);
+    const fixed = document.createElement('details');
+    fixed.className = 'llm-original-dossier';
+    fixed.append(el('summary', '', '接管时身体档案（固定原档·仅供回顾）'), el('div', 'llm-muted', '这是接管瞬间的完整快照，后续变化不会改写它；不作为当前状态重复注入。'));
+    for (const section of body.sections || carrierCardSections(body.rawCard)) {
+        const details = document.createElement('details');
+        details.className = 'llm-life llm-section';
+        details.append(el('summary', '', section.title), el('div', 'llm-section-content', section.content));
+        fixed.append(details);
     }
     const raw = document.createElement('details');
     raw.className = 'llm-life';
     raw.append(el('summary', '', '查看完整原始人物卡文本'), el('pre', 'llm-json', body.text));
-    panel.append(heading, intro, sections, raw);
+    fixed.append(raw);
+    panel.append(fixed);
 }
 
-function renderBackgroundStory(panel, body) {
+function renderBackgroundStory(panel, body, statData) {
     if (!body) return;
-    const story = String(body.backgroundStory || carrierBackgroundStory(body.rawCard || body.text) || '').trim();
+    const story = String(carrierBackgroundStory(effectiveDossier(body, statData).text) || body.backgroundStory || '').trim();
     panel.append(el('h3', 'llm-section-title', '当前身体人生背景（每轮发送给 AI）'));
     if (!story) {
         const empty = el('section', 'llm-background-empty');
@@ -994,7 +1056,7 @@ function renderRuntimeBodyState(panel, statData, runtimeInfo = {}) {
     }
     if (!effects.length && !changes.length && !runtimeInfo.appliedOperations) return;
 
-    panel.append(el('h3', 'llm-section-title', '当前有效动态覆盖（已发送给 AI）'));
+    panel.append(el('h3', 'llm-section-title', '当前有效动态覆盖（实时状态与数值）'));
     const sourceFloor = Number(runtimeInfo?.sourceMessageIndex ?? -1) + 1;
     const note = runtimeInfo.appliedOperations
         ? `已读取到第 ${sourceFloor} 楼，并从最新正文变量更新中提前补全 ${runtimeInfo.appliedOperations} 项尚待 MVU 落盘的安全变化；这些内容已经加入本轮 AI 上下文。`
@@ -1029,7 +1091,7 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
     const messages = protocolMessages();
     const importedBody = currentImportedBody();
     const confirmedProfile = confirmedCarrierProfile(messages, trustedCarrierOptions());
-    const importedProfile = asObject(importedBody?.profile);
+    const importedProfile = importedBody ? { ...asObject(importedBody.profile), ...parseCarrierCard(effectiveDossier(importedBody, statData).text), 姓名: importedBody.profile?.姓名 } : {};
     const hasImportedProfile = Object.keys(importedProfile).length > 0;
     const hasConfirmedProfile = Object.keys(confirmedProfile).length > 0;
     const chatProfile = hasImportedProfile ? importedProfile : hasConfirmedProfile ? confirmedProfile : supplementalPlayerProfile(messages, statData);
@@ -1092,7 +1154,7 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
     details.append(el('summary', '', '查看完整 stat_data.主角'), el('pre', 'llm-json', pretty(main)));
     const warnings = carryoverWarnings(statData);
     panel.append(hero, grid);
-    renderBackgroundStory(panel, importedBody);
+    renderBackgroundStory(panel, importedBody, statData);
     if (summary.usedSupplementalProfile) {
         panel.append(el('div', 'llm-muted', hasImportedProfile
             ? '完整身份资料来自插件保存的当前人物卡；地点、资源与状态读取最新 stat_data。'
@@ -1110,7 +1172,7 @@ function renderCurrent(panel, statData, runtimeInfo = {}) {
     const receipt = el('div', lastPromptStats.injected ? 'llm-injection-receipt' : 'llm-warning');
     receipt.textContent = promptStatsText();
     panel.append(receipt);
-    renderFullBody(panel, importedBody);
+    renderFullBody(panel, importedBody, statData);
 }
 
 async function renderLives(panel, statData) {
@@ -1171,9 +1233,9 @@ function renderSettings(panel) {
     injection.className = 'text_pole';
     for (const [value, text] of [
         ['strict', '严格主档案（推荐·每轮完整）'],
-        ['smart', '智能注入（首轮完整）'],
+        ['smart', '兼容智能模式（动态主档仍完整）'],
         ['full', '每轮完整注入'],
-        ['compact', '始终精简注入'],
+        ['compact', '兼容精简模式（动态主档仍完整）'],
         ['off', '不注入'],
     ]) {
         const option = document.createElement('option');
@@ -1192,7 +1254,7 @@ function renderSettings(panel) {
     const promptMeter = el('div', 'llm-prompt-meter', promptStatsText());
     const promptPreview = document.createElement('details');
     promptPreview.className = 'llm-prompt-preview';
-    promptPreview.append(el('summary', '', '查看本轮实际发送给 AI 的插件资料'), el('pre', 'llm-json', lastPromptText || '当前尚未生成注入内容'));
+    promptPreview.append(el('summary', '', '查看已写入酒馆提示区的完整资料'), el('pre', 'llm-json', lastPromptText || '当前尚未生成注入内容'), el('div', 'llm-muted', '这里可核对插件提交的内容；不代表模型服务已接收或保证模型逐条遵守。实际请求以酒馆的提示查看器为准。'));
 
     const importLabel = el('label', 'llm-label', '从正文选择人物卡');
     const cardSelect = document.createElement('select');
@@ -1617,6 +1679,10 @@ function scheduleRefresh(reason = '正文楼层变化') {
     if (result.restored && result.current?.sourceRecordKey && result.current?.sourceRecordKey !== result.previous?.sourceRecordKey) {
         notify('success', `已自动恢复可信身体档案：${result.current.profile?.姓名 || '当前身体'}`);
     }
+    const body = currentImportedBody();
+    if (body && ['MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED'].includes(reason)) {
+        effectiveDossier(body, readEffectiveStatData().statData, { retractChanged: true, retractDeleted: reason === 'MESSAGE_DELETED' });
+    }
     refreshTimers.forEach(clearTimeout);
     refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(async () => {
         await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
@@ -1636,7 +1702,7 @@ function registerEvents() {
     }
     for (const type of ['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS']) {
         if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => {
-            if (sharedRuntime.token === RUNTIME_TOKEN) updateCurrentBodyPrompt();
+            if (sharedRuntime.token === RUNTIME_TOKEN) return updateCurrentBodyPrompt();
         });
     }
 }
@@ -1661,7 +1727,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.10.0 已加载');
+    console.log('[历代人生管理器] v0.11.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });
