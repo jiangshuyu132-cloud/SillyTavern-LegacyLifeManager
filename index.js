@@ -991,8 +991,21 @@ function renderFullBody(panel, body, statData) {
         sections.append(details);
     }
     panel.append(heading, intro);
-    if (dossier.state.pending) panel.append(el('div', 'llm-warning', `第 ${dossier.state.pending.sourceIndex} 楼尚未完成动态档案核对，下一次普通回复将携带补齐要求。原文仍保留；如该楼存在身体变化，目前不能宣称已保存。`));
-    for (const issue of dossier.state.issues) panel.append(el('div', 'llm-warning', `动态档案未接收：${issue}。下一轮会要求模型按协议重新输出。`));
+    if (dossier.state.pending) panel.append(el('div', 'llm-warning', `仍有 ${dossier.state.repairs.length} 条正文待核对（最早第 ${dossier.state.pending.sourceIndex} 楼）。已核对字段已保存；未接收项及完整原文会分批带入普通回复，收到有效修正或明确核对回执后才清除，不把一次空回执当成补齐。`));
+    for (const issue of dossier.state.issues.slice(0,8)) panel.append(el('div', 'llm-warning', `未接收项：${issue}`));
+    if (dossier.state.repairs.length) {
+        const diagnostics = document.createElement('details');
+        diagnostics.className = 'llm-life';
+        diagnostics.append(el('summary', '', '查看待补齐来源与具体失败引用'));
+        for (const repair of dossier.state.repairs) {
+            const detail = document.createElement('details');
+            detail.append(el('summary', '', `第 ${repair.sourceIndex} 楼 · ${(repair.rejected || []).length ? '部分字段待修正' : '待核对正文'}`));
+            for (const rejected of repair.rejected || []) detail.append(el('div', 'llm-warning', `${rejected.section}/${rejected.field}：${rejected.reason}\n失败引用（未认定为事实）：${rejected.evidence || '未提供'}`));
+            detail.append(el('div', 'llm-section-content', repair.text || '此楼未提取到有效正文，请检查原回复是否只有更新块。'));
+            diagnostics.append(detail);
+        }
+        panel.append(diagnostics);
+    }
     panel.append(sections);
     const fixed = document.createElement('details');
     fixed.className = 'llm-original-dossier';
@@ -1727,7 +1740,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.11.0 已加载');
+    console.log('[历代人生管理器] v0.11.1 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

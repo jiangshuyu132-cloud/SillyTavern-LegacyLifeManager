@@ -230,3 +230,27 @@ test('双档案界面动态板块与提示完全同源，固定原档仍单独�
   assert.doesNotMatch(prompt,/妆容：无/);
  } finally {globalThis.document.createElement=oldCreate;}
 });
+
+test('补齐失败原文及字段实际进入下一轮提示，修正后主档继续注入',async()=>{
+ const after=setup();plugin.reconcileConversation();
+ const body=ctx.chatMetadata.legacy_life_manager.currentBody;
+ const text='— 当前形态基础 —\n姓名：新身体\n种族：人类\n职业：画师\n— 外貌详述 —\n妆容：无\n面容：左眉有痣';
+ Object.assign(body,{rawCard:text,text,sections:carrierCardSections(text),profile:{姓名:'新身体',种族:'人类',职业:'画师'}});
+ after.主角.种族='人类';after.主角.职业='画师';ctx.chat[0].mes='旧卡已隐藏';
+ const change={op:'set',section:'外貌详述',field:'妆容',value:'淡红色唇妆',evidence:'她化妆了但这不是原句。'};
+ const block=changes=>'<LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes})+'</LegacyBodyUpdate>';
+ ctx.chat.push({is_user:true,mes:'化妆'}, {send_date:'failed-source',mes:'她涂好了**淡红色**唇膏。<details><summary>外貌记录</summary>'+block([change])+'</details>'});
+ ctx.extensionPrompts={};ctx.setExtensionPrompt=async(key,value)=>{injectedPrompt=value;ctx.extensionPrompts[key]={value};};
+ await plugin.updateCurrentBodyPrompt();
+ assert.match(injectedPrompt,/她涂好了/);assert.match(injectedPrompt,/她化妆了但这不是原句/);
+ assert.match(injectedPrompt,/reviewedSources/);assert.equal(body.dynamicDossier.repairs.length,1);
+ ctx.chat.at(-1).is_system=true;ctx.chat.at(-1).mes='该楼已总结';
+ ctx.chat.push({is_user:true,mes:'继续'},{send_date:'empty-receipt',mes:'她走到窗边。'+block([])});
+ await plugin.updateCurrentBodyPrompt();
+ assert.equal(body.dynamicDossier.repairs.length,1);assert.match(injectedPrompt,/她涂好了/);
+ ctx.chat.push({is_user:true,mes:'继续散步'}, {send_date:'corrected-source',mes:'她望向窗外。'+block([{...change,evidence:'她涂好了淡红色唇膏。'}])});
+ await plugin.updateCurrentBodyPrompt();
+ assert.equal(body.dynamicDossier.repairs.length,0);
+ assert.match(injectedPrompt,/妆容：淡红色唇妆/);assert.ok(injectedPrompt.includes(body.dynamicDossier.text));
+ assert.doesNotMatch(injectedPrompt,/妆容：无/);assert.equal(body.rawCard,text);
+});

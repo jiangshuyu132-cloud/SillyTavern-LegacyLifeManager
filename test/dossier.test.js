@@ -150,3 +150,115 @@ test('状态条不会删掉长疾病设定，明确清空状态时标注不再�
     const result=save(b,[],{主角:{状态效果:{}}});
     assert.match(result.text,/运动时牵扯疼痛/);assert.match(result.text,/已移除项目不得复活/);
 });
+
+test('任意折叠标题不能抢走无标签正文；常见排版差异不误拒',()=>{
+    const b=body();
+    const change=set('外貌详述','妆容','淡红色唇妆','她涂好了淡红色唇膏。');
+    const m=message(b,0,'她涂好了**淡红色**唇膏。',[change]);
+    m.mes=m.mes.replace(/<\/?gametxt>/g,'').replace('<LegacyBodyUpdate>','<details><summary>档案更新记录</summary><LegacyBodyUpdate>')+'</details>';
+    const result=save(b,[m]);
+    assert.match(narrativeEvidence(m),/她涂好了/);
+    assert.match(result.text,/妆容：淡红色唇妆/);
+    assert.equal(result.state.issues.length,0);
+});
+
+test('一项引用失败不连带丢弃其他有效字段，且错误定位到具体字段',()=>{
+    const b=body();
+    const bad=set('当前穿着','上衣','蓝色外套','她穿好了蓝色外套。');
+    const result=save(b,[message(b,0,makeup.evidence,[makeup,bad])]);
+    assert.match(result.text,/妆容：淡红唇色/);
+    assert.match(result.text,/上衣：灰色棉衫/);
+    assert.match(result.state.issues.join('；'),/当前穿着.*上衣/);
+    assert.equal(result.state.repairs.length,1);
+    assert.match(dossierUpdateInstructions(b,result),/她穿好了蓝色外套/);
+});
+
+test('新一轮空回执不能假装修复旧拒绝项；隐藏后仍携带原文与错误项',()=>{
+    const b=body();
+    const bad={...makeup,evidence:'她的脸现在已经上妆。'};
+    save(b,[message(b,0,makeup.evidence,[bad])]);
+    let result=save(b,[message(b,1,'她走到了街口。')]);
+    assert.equal(result.state.repairs.length,1);
+    assert.match(dossierUpdateInstructions(b,result),/她已经化好妆/);
+    assert.match(dossierUpdateInstructions(b,result),/她的脸现在已经上妆/);
+    const correction=message(b,2,'她停下脚步。',[makeup]);
+    result=save(b,[correction]);
+    assert.match(result.text,/妆容：淡红唇色/);
+    assert.equal(result.state.repairs.length,0);
+    assert.equal(result.state.issues.length,0);
+    assert.equal(save(b,[correction]).changed,false);
+});
+
+test('多条遗漏排队保留，空变化只能显式核对指定旧来源',()=>{
+    const b=body();save(b,[]);
+    const messages=[{send_date:'old-a',mes:'她说自己不打算化妆。'},{send_date:'old-b',mes:'她换上了蓝色外套。'}];
+    let result=save(b,messages);
+    assert.equal(result.state.repairs.length,2);
+    const id=result.state.repairs[0].id;
+    const receipt=message(b,2,'她继续走路。');
+    receipt.mes=receipt.mes.replace('"changes":[]',`"changes":[],"reviewedSources":["${id}"]`);
+    messages.push(receipt);
+    result=save(b,messages);
+    assert.equal(result.state.repairs.length,1);
+    assert.match(result.state.repairs[0].text,/蓝色外套/);
+    assert.equal(save(b,messages).changed,false);
+});
+
+test('升级即重读已被旧校验误拒的回复，不需要再生成一次',()=>{
+    const b=body(),m=message(b,0,'她涂好了**淡红色**唇膏。',[set('外貌详述','妆容','淡红色唇妆','她涂好了淡红色唇膏。')]);
+    b.dynamicDossier={version:1,bodyId:dossierBodyId(b),events:[],issues:['旧错误'],pending:{key:'source-0',sourceIndex:0,text:narrativeEvidence(m)}};
+    const result=save(b,[m]);
+    assert.match(result.text,/妆容：淡红色唇妆/);assert.equal(result.state.pending,null);
+});
+
+test('证据排版兼容不允许改写否定、数值、推理或把未来正文当旧证据',()=>{
+    for(const actual of ['她没有涂好淡红色唇膏。','<think>她涂好了淡红色唇膏。</think>','<image>她涂好了淡红色唇膏。</image>']){
+        const b=body();const c=set('外貌详述','妆容','淡红色唇妆','她涂好了淡红色唇膏。');
+        assert.doesNotMatch(save(b,[message(b,0,actual,[c])]).text,/妆容：淡红色唇妆/);
+    }
+    const b=body();const early=message(b,0,'她坐在家里。',[makeup]);
+    assert.doesNotMatch(save(b,[early,{mes:makeup.evidence}]).text,/妆容：淡红唇色/);
+    assert.doesNotMatch(save(b,[]).text,/妆容：淡红唇色/);
+});
+
+test('显式删除或改写被引用的旧正文会撤销依赖它的补齐结果',()=>{
+    for(const mode of ['edit','delete']){
+        const b=body();const origin={send_date:'original-fact',mes:makeup.evidence};
+        const reply=message(b,1,'她走到街口。',[makeup]);
+        save(b,[origin,reply]);
+        const messages=mode==='edit'?[{...origin,mes:'她并未化妆。'},reply]:[reply];
+        const result=save(b,messages,{},mode==='edit'?{retractChanged:true}:{retractDeleted:true});
+        assert.doesNotMatch(result.text,/妆容：淡红唇色/);
+        assert.ok(result.state.repairs.length);
+    }
+});
+
+test('待补齐队列不截断长原文，按完整来源分批注入且保留余项',()=>{
+    const b=body();save(b,[]);
+    const messages=Array.from({length:5},(_,i)=>({send_date:`backlog-${i}`,mes:`她考虑化妆${i}。`+'普通叙述。'.repeat(1000)}));
+    const result=save(b,messages),prompt=dossierUpdateInstructions(b,result);
+    assert.equal(result.state.repairs.length,5);
+    assert.match(prompt,/共有 5 条待核对来源，本轮提供 3 条完整原文/);
+    assert.ok(prompt.includes(messages[0].mes));
+    assert.ok(!prompt.includes(messages[4].mes));
+    assert.equal(save(b,messages).changed,false);
+});
+
+test('已核对字段在部分失败项被隐藏时不丢失',()=>{
+    const b=body();const origin={send_date:'origin',mes:makeup.evidence};
+    const failed=message(b,1,'她站在街边。',[makeup,set('当前穿着','上衣','蓝衣','不存在的依据正文')]);
+    save(b,[origin,failed]);
+    let result=save(b,[{...origin,is_system:true,mes:'已总结'},failed]);
+    assert.match(result.text,/妆容：淡红唇色/);assert.ok(result.state.repairs.some(r=>r.rejected.some(e=>e.field==='上衣')));
+    result=save(JSON.parse(JSON.stringify(b)),[]);
+    assert.match(result.text,/妆容：淡红唇色/);
+});
+
+test('半截更新和未闭合推理不能污染下一轮正文证据',()=>{
+    const b=body();
+    for(const start of ['<LegacyBodyUpdate>{"evidence":"','<think>','<image>']){
+        const partial={send_date:'partial',mes:'她坐在门口。'+start+makeup.evidence};
+        assert.doesNotMatch(narrativeEvidence(partial),/化好妆/);
+        assert.doesNotMatch(resolveDynamicDossier(b,[partial,message(b,1,'她继续休息。',[makeup])]).text,/妆容：淡红唇色/);
+    }
+});

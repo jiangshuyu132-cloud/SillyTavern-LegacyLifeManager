@@ -36,5 +36,28 @@ globalThis.qaContext={chatId:'qa-only',chat:[{is_user:false,send_date:'qa-1',mes
 globalThis.SillyTavern={getContext:()=>qaContext};
 globalThis.getVariables=()=>({stat_data:stat});
 globalThis.toastr={info:console.log,warning:console.warn,error:console.error,success:console.log};
+const repairMode=new URLSearchParams(location.search).has('repair');
+if(repairMode){
+    const mixed=[changes[0],{...changes[1],evidence:'她穿着蓝衣出门了，但原文并非这样写。'}];
+    qaContext.chat[0].mes='她化好**淡红唇妆**和细眼线，换上了蓝色外套。<details><summary>本轮人物更新</summary><LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes:mixed})+'</LegacyBodyUpdate></details>';
+}
 await import('/index.js');
+if(repairMode){
+    const controls=document.createElement('aside');
+    const output=document.createElement('pre');output.id='qa-receipt';
+    const add=(label,changes)=>{
+        const button=document.createElement('button');button.textContent=label;
+        button.onclick=async()=>{
+            qaContext.chat.push({send_date:`qa-${qaContext.chat.length}`,mes:'<gametxt>她停在路边。</gametxt><LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes})+'</LegacyBodyUpdate>'});
+            for(const cb of callbacks.MESSAGE_RECEIVED||[])await cb(qaContext.chat.length-1);
+            await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{},'normal');
+            const state=qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier;
+            const prompt=qaContext.extensionPrompts.legacy_life_manager_current_body.value;
+            output.textContent=`待补齐：${state.repairs.length}\n主档与提示一致：${prompt.includes(state.text)}\n${state.text}`;
+        };
+        controls.append(button);
+    };
+    add('模拟无关空回执',[]);add('模拟正确补齐',[changes[1]]);
+    controls.append(output);document.body.prepend(controls);
+}
 </script></html>

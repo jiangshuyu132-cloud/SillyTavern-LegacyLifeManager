@@ -7,7 +7,6 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const allowed = new Set(['index.js','core.js','dossier.js','strict-protocol.js','mvu-adapter.js','style.css','test/fixtures/dual-dossier.html']);
 const server = createServer(async (req,res) => {
@@ -17,6 +16,10 @@ const server = createServer(async (req,res) => {
     res.end(await readFile(resolve(root,name)));
 });
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
+if (process.argv.includes('--serve')) {
+    console.log(`Synthetic QA fixture: http://127.0.0.1:${server.address().port}/`);
+} else {
+const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 let browser;
 try {
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
@@ -39,4 +42,5 @@ try {
 } finally {
     await browser?.close();
     await new Promise(r=>server.close(r));
+}
 }
