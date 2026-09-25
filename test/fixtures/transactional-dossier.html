@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>版本档案与独立整理回归</title>
+<link rel="stylesheet" href="/style.css">
+<style>body{margin:0;padding:24px;background:#15171e;color:#eee;font:16px system-ui}#extensions_settings2{max-width:980px;margin:auto}button{font:inherit}*{box-sizing:border-box}</style>
+<div id="extensions_settings2"></div><div id="chat"></div>
+<script type="module">
+const stat={主角:{种族:'人类',职业:'画师',生命值:{当前:100,上限:100},状态效果:{},金钱:250}};
+const callbacks={};
+const eventTypes=Object.fromEntries(['CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_EDITED','MESSAGE_UPDATED','MESSAGE_SWIPED','MESSAGE_DELETED','GENERATION_STARTED','GENERATION_ENDED','GENERATION_STOPPED'].map(x=>[x,x]));
+const emit=async(type,...args)=>{for(const cb of callbacks[type]||[]) await cb(...args);};
+globalThis.qaRequests=[]; globalThis.qaFail=false;
+globalThis.qaContext={chatId:'qa-only',chat:[{mes:'<customized>自定义开局开始</customized>'},{is_user:true,mes:`【剧情生成上下文】
+姓名: 林晓
+年龄: 28岁
+【初始开局剧情】
+【自定义开局】
+描述: # 林晓的开局资料
+## 一、人生背景
+出生：河畔村庄
+# 二、基础资料
+姓名：林晓
+种族：人类
+职业：画师
+# 三、外貌详述
+妆容：无
+头发：黑色长发
+面容：左眉有痣
+# 四、当前穿着
+上衣：灰衫`},{mes:'<gametxt>林晓走到画店门前。</gametxt>',stat_data:structuredClone(stat)}],
+chatMetadata:{},extensionSettings:{},extensionPrompts:{},eventTypes,eventSource:{on(type,callback){(callbacks[type]??=[]).push(callback);}},
+async setExtensionPrompt(key,value){this.extensionPrompts[key]={value};}, saveMetadataDebounced(){}, async saveMetadata(){}, saveSettingsDebounced(){}, getWorldInfoNames(){return [];},
+async generateRaw(config){
+ qaRequests.push(config); await new Promise(r=>setTimeout(r,15));
+ if(qaFail)throw new Error('模拟接口不可用');
+ const input=JSON.parse(config.prompt);
+ const section=input.sections.find(s=>s.section.includes('外貌')).section;
+ return JSON.stringify({version:1,bodyId:input.bodyId,sourceId:input.sourceId,sourceHash:input.sourceHash,baseVersion:input.baseVersion,reviewed:true,
+ changes:input.narrative.includes('涂好了')?[{op:'set',section,field:'妆容',value:'淡红唇妆',evidence:'林晓涂好了淡红色唇膏。'}]:[]});
+}};
+globalThis.SillyTavern={getContext:()=>qaContext};
+globalThis.getVariables=opts=>({stat_data:qaContext.chat[opts.message_id]?.stat_data});
+globalThis.toastr={info(){},warning(){},error(){},success(){}};
+globalThis.qaGate=async()=>{let stopped=false;await legacyLifeManagerGenerationInterceptor([],50000,()=>{stopped=true;},'normal');return stopped;};
+globalThis.qaReply=async(text,fail=false)=>{
+ qaFail=fail; qaContext.chat.push({is_user:true,mes:'继续'});
+ await emit('GENERATION_STARTED','normal',{},false);
+ if(await qaGate())return;
+ qaContext.chat.push({mes:`<gametxt>${text}</gametxt>`,stat_data:structuredClone(stat)});
+ await emit('MESSAGE_RECEIVED',qaContext.chat.length-1); await emit('GENERATION_ENDED',qaContext.chat.length-1);
+};
+globalThis.qaHide=async()=>{const m=qaContext.chat.at(-1);m.is_system=true;m.mes='已总结';await emit('MESSAGE_UPDATED',qaContext.chat.length-1);};
+globalThis.qaDeleteLast=async()=>{qaContext.chat.pop();await emit('MESSAGE_DELETED',qaContext.chat.length);};
+await import('/index.js');
+</script></html>

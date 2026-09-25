@@ -27,6 +27,7 @@ globalThis.getVariables=opts=>{const index=opts.message_id==='latest'?ctx.chat.l
 globalThis.updateVariablesWith=(fn,opts)=>{const index=opts.message_id==='latest'?ctx.chat.length-1:opts.message_id;const next=fn({stat_data:ctx.chat[index].stat_data});ctx.chat[index].stat_data=next.stat_data;};
 globalThis.fetch=async()=>{fetchCount++;if(changeDuringRead)ctx.chatId='different-chat';return {ok:readbackOK,async json(){return structuredClone(book);}};};
 const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'utf8');source=source.replace(/from '(\.\/[^']+)'/g,(_all,path)=>`from '${new URL(path,url).href}'`);source+='\nexport {archivePendingLife,reconcileConversation,buildCurrentBodyPrompt,readEffectiveStatData,applyMoneyInheritance,updateCurrentBodyPrompt,backupDigest,importBackupPayload,renderFullBody};';
+source+='\nexport {synchronizeDossier, effectiveDossier};\n//# sourceURL=legacy-life-integration-test.js';
 const plugin=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const card='【当前载体人物设定开始】\n<div><b>世代编号：</b>第2世<br><b>姓名：</b>新身体<br></div>\n【当前载体人物设定结束】';
 const draft='词条名称: 第1世·旧身体\n重要人物: 守卫\n重要经历：守住城门。';
@@ -138,7 +139,7 @@ test('完整备份导入后恢复当前身体并通过AI上下文注入回读验
  const payload={format:'sillytavern-legacy-life-backup',version:2,exportedAt:new Date().toISOString(),chatId:'test',statData:structuredClone(after),worldBookName:'',pluginSettings:{worldBookName:'现有测试世界书',injectionMode:'compact',floatingPosition:{xRatio:0.25,yRatio:0.75}},pluginLedger:ledger,archiveEntries:[],transcript:[]};
  const envelope={...payload,integrity:await plugin.backupDigest(payload)};
  ctx.chatMetadata.legacy_life_manager.currentBody=null;ctx.chatMetadata.legacy_life_manager.lives=[];
- ctx.chat[0].mes='旧楼层正文已被总结助手隐藏';ctx.chat[0].swipes=[];
+ ctx.chat[0].is_system=true;ctx.chat[0].mes='旧楼层正文已被总结助手隐藏';ctx.chat[0].swipes=[];
  ctx.chat.push({is_user:true,mes:'继续生活'});
  const result=await plugin.importBackupPayload(envelope,{ask:false});
  assert.equal(result.activated,true);
@@ -178,7 +179,7 @@ test('人生背景作为独立当前身体资料实际进入每轮AI上下文',(
  assert.match(prompt,/不得把它误当成前世经历/);
  assert.match(source,/本人物卡未提供人生背景/);
 });
-test('生成前把正文最新身体变化实际写入AI上下文，未确认身份补丁不能偷换身体',async()=>{
+test('资源状态照常注入，但变量中的身体镜像不能绕过独立档案校验',async()=>{
  setup();plugin.reconcileConversation();ctx.chat.push(
   {is_user:true,mes:'检查衣服和伤口'},
   {is_user:false,mes:`正文<UpdateVariable><JSONPatch>${JSON.stringify([
@@ -195,11 +196,11 @@ test('生成前把正文最新身体变化实际写入AI上下文，未确认身
  assert.equal(effective.appliedOperations,2);
  await plugin.updateCurrentBodyPrompt();
  assert.match(injectedPrompt,/当前有效动态覆盖｜本轮必须执行/);
- assert.match(injectedPrompt,/沾血的白袍/);
+ assert.doesNotMatch(injectedPrompt,/沾血的白袍/);
  assert.match(injectedPrompt,/左臂割伤/);
  assert.doesNotMatch(injectedPrompt,/候选身体/);
 });
-test('刷新时用可信备份恢复缺少提交层快照；暂时读不到确认层不会自动清空',()=>{
+test('来源仍在时可恢复缺少MVU快照；物理删除确认层则自动撤销且不复活',()=>{
  const after=setup();plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;
  data.backups=[{at:new Date().toISOString(),reason:'测试安全备份',currentBody:structuredClone(data.currentBody),lives:structuredClone(data.lives)}];data.currentBody=null;data.lives=[];
  const waiting={阶段:'等待确认',当前世代编号:1,当前身体死亡已确认:true,当前身体死亡信息:'已死亡',待确认人物卡:'【候选】新身体。详细设定见正文候选卡。',待归档人生词条:'',归档写入状态:'无待处理'};
@@ -208,19 +209,18 @@ test('刷新时用可信备份恢复缺少提交层快照；暂时读不到确�
  delete ctx.chat[2].stat_data;ctx.chat[2].mes=`<UpdateVariable><JSONPatch>${JSON.stringify([{op:'replace',path:'/主角/换身状态',value:active},{op:'replace',path:'/主角/载体档案',value:{姓名:'新身体'}},{op:'insert',path:'/历代记忆摘要/-',value:{世代编号:1,身体姓名:'旧身体',详细词条名称:'第1世·旧身体'}}])}</JSONPatch></UpdateVariable>`;
  ctx.chat.push({is_user:true,mes:'继续生活'},{is_user:false,mes:'后续正文',stat_data:{主角:{载体档案:{姓名:'新身体'},生命值:{当前:100}}}});
  const restored=plugin.reconcileConversation();assert.equal(restored.current.profile.姓名,'新身体');assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
- ctx.chat.splice(1,1);const preserved=plugin.reconcileConversation();assert.equal(preserved.cleared,false);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
- const cleared=plugin.reconcileConversation({force:true,reason:'手动从当前正文重建'});assert.equal(cleared.cleared,true);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
+ ctx.chat.splice(1,1);const removed=plugin.reconcileConversation({reason:'MESSAGE_DELETED'});assert.equal(removed.cleared,true);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
+ plugin.reconcileConversation();assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
 });
-test('运行时完全隐藏旧人物卡时，用备份与两个实时身份字段恢复当前身体',()=>{
+test('历史消息物理缺失时不能仅凭两个身份字段从备份复活已撤销身体',()=>{
  setup();plugin.reconcileConversation();const data=ctx.chatMetadata.legacy_life_manager;
  const body=structuredClone(data.currentBody);body.profile={...body.profile,种族:'高等精灵',职业:'法师'};
  data.backups=[{at:new Date().toISOString(),reason:'误清空前自动备份',currentBody:body,lives:structuredClone(data.lives)}];
  data.currentBody=null;data.lives=[];
  ctx.chat=[{is_user:false,mes:'普通正文，无人物卡字段',stat_data:{主角:{种族:'高等精灵',职业:'法师',生命值:{当前:535,上限:535}}}}];
  const restored=plugin.reconcileConversation();
- assert.equal(restored.restored,true);
- assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,'新身体');
- assert.match(ctx.chatMetadata.legacy_life_manager.lastTrustedRecovery.reason,/至少两个稳定字段/);
+ assert.equal(Boolean(restored.restored),false);
+ assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody,null);
 });
 
 test('完整动态档实际写入扩展提示；后续轮次、隐藏楼层和导入备份仍包含变化',async()=>{
@@ -229,7 +229,7 @@ test('完整动态档实际写入扩展提示；后续轮次、隐藏楼层和�
  const text='— 当前形态基础 —\n姓名：新身体\n种族：人类\n职业：画师\n— 外貌详述 —\n头发：黑色长发\n面容：左眉有痣\n妆容：无\n— 当前穿着 —\n上衣：白色棉衫\n鞋子：短靴';
  Object.assign(data.currentBody,{rawCard:text,text,sections:carrierCardSections(text),profile:{姓名:'新身体',种族:'人类',职业:'画师'}});
  after.主角.种族='人类';after.主角.职业='画师';
- ctx.chat[0].mes='旧卡楼层已隐藏';
+ ctx.chat[0].is_system=true;ctx.chat[0].mes='旧卡楼层已隐藏';
  ctx.chat.push({is_user:true,mes:'去化妆'}, {is_user:false,send_date:'makeup-source',mes:'<gametxt>她涂好了淡红色唇膏。</gametxt><LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(data.currentBody),changes:[{op:'set',section:'外貌详述',field:'妆容',value:'淡红色唇妆',evidence:'她涂好了淡红色唇膏。'}]})+'</LegacyBodyUpdate>'});
  ctx.extensionPrompts={};ctx.setExtensionPrompt=async(key,value)=>{injectedPrompt=value;ctx.extensionPrompts[key]={value};};
  await plugin.updateCurrentBodyPrompt();
@@ -252,7 +252,7 @@ test('生成拦截器等待投递，实际提示区不符则终止生成，不�
  ctx.extensionPrompts={};
  ctx.setExtensionPrompt=async(key,value)=>{await new Promise(resolve=>setTimeout(resolve,8));injectedPrompt=value;ctx.extensionPrompts[key]={value};};
  await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{aborted=true;},'normal');
- assert.equal(aborted,false);assert.match(injectedPrompt,/完整动态身体档案维护协议/);
+ assert.equal(aborted,false);assert.match(injectedPrompt,/档案维护分工/);
  ctx.setExtensionPrompt=async()=>{};ctx.extensionPrompts={};
  await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{aborted=true;},'normal');
  assert.equal(aborted,true);
@@ -261,10 +261,10 @@ test('生成拦截器等待投递，实际提示区不符则终止生成，不�
 test('双档案界面动态板块与提示完全同源，固定原档仍单独完整展示',()=>{
  const after=setup();ctx.chat.push({is_user:true,mes:'散步'});
  const text='— 当前形态基础 —\n姓名：新身体\n— 外貌详述 —\n妆容：无\n面容：自然五官';
- const body={rawCard:text,text,profile:{姓名:'新身体'},generation:2,sections:carrierCardSections(text),confirmationMessageIndex:1};
+ const body={rawCard:text,text,profile:{姓名:'新身体'},generation:2,sections:carrierCardSections(text),confirmationMessageIndex:2};
  ctx.chat.push({mes:'她已经化好了淡妆。<LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes:[{op:'set',section:'外貌详述',field:'妆容',value:'淡妆',evidence:'她已经化好了淡妆。'}]})+'</LegacyBodyUpdate>'});
  const prompt=plugin.buildCurrentBodyPrompt(body,after,'strict').prompt;
- class Node {children=[];textContent='';append(...items){this.children.push(...items);} }
+ class Node {children=[];textContent='';append(...items){this.children.push(...items);} addEventListener(){} }
  const oldCreate=globalThis.document.createElement;globalThis.document.createElement=()=>new Node();
  try {
   const panel=new Node();plugin.renderFullBody(panel,body,after);
@@ -278,26 +278,63 @@ test('双档案界面动态板块与提示完全同源，固定原档仍单独�
  } finally {globalThis.document.createElement=oldCreate;}
 });
 
-test('补齐失败原文及字段实际进入下一轮提示，修正后主档继续注入',async()=>{
+test('独立整理失败保留原文；隐藏后重试成功，并把完整动态档写入提示',async()=>{
  const after=setup();plugin.reconcileConversation();
  const body=ctx.chatMetadata.legacy_life_manager.currentBody;
  const text='— 当前形态基础 —\n姓名：新身体\n种族：人类\n职业：画师\n— 外貌详述 —\n妆容：无\n面容：左眉有痣';
  Object.assign(body,{rawCard:text,text,sections:carrierCardSections(text),profile:{姓名:'新身体',种族:'人类',职业:'画师'}});
- after.主角.种族='人类';after.主角.职业='画师';ctx.chat[0].mes='旧卡已隐藏';
+ after.主角.种族='人类';after.主角.职业='画师';ctx.chat[0].is_system=true;ctx.chat[0].mes='旧卡已隐藏';
  const change={op:'set',section:'外貌详述',field:'妆容',value:'淡红色唇妆',evidence:'她化妆了但这不是原句。'};
  const block=changes=>'<LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes})+'</LegacyBodyUpdate>';
  ctx.chat.push({is_user:true,mes:'化妆'}, {send_date:'failed-source',mes:'她涂好了**淡红色**唇膏。<details><summary>外貌记录</summary>'+block([change])+'</details>'});
  ctx.extensionPrompts={};ctx.setExtensionPrompt=async(key,value)=>{injectedPrompt=value;ctx.extensionPrompts[key]={value};};
  await plugin.updateCurrentBodyPrompt();
- assert.match(injectedPrompt,/她涂好了/);assert.match(injectedPrompt,/她化妆了但这不是原句/);
- assert.match(injectedPrompt,/reviewedSources/);assert.equal(body.dynamicDossier.repairs.length,1);
+ assert.equal(body.dynamicDossier.repairs.length,1);
+ let bad=true;
+ ctx.generateRaw=async config=>{
+  const input=JSON.parse(config.prompt);assert.match(input.narrative,/她涂好了/);
+  return JSON.stringify({version:1,bodyId:input.bodyId,sourceId:input.sourceId,sourceHash:input.sourceHash,baseVersion:input.baseVersion,reviewed:true,changes:[{...change,evidence:bad?change.evidence:'她涂好了淡红色唇膏。'}]});
+ };
+ await assert.rejects(plugin.synchronizeDossier({manual:true}),/引用未匹配正文/);
+ assert.equal(body.dynamicDossier.repairs.length,1);
  ctx.chat.at(-1).is_system=true;ctx.chat.at(-1).mes='该楼已总结';
- ctx.chat.push({is_user:true,mes:'继续'},{send_date:'empty-receipt',mes:'她走到窗边。'+block([])});
- await plugin.updateCurrentBodyPrompt();
- assert.equal(body.dynamicDossier.repairs.length,1);assert.match(injectedPrompt,/她涂好了/);
- ctx.chat.push({is_user:true,mes:'继续散步'}, {send_date:'corrected-source',mes:'她望向窗外。'+block([{...change,evidence:'她涂好了淡红色唇膏。'}])});
- await plugin.updateCurrentBodyPrompt();
+ bad=false;await plugin.synchronizeDossier({manual:true});
  assert.equal(body.dynamicDossier.repairs.length,0);
  assert.match(injectedPrompt,/妆容：淡红色唇妆/);assert.ok(injectedPrompt.includes(body.dynamicDossier.text));
  assert.doesNotMatch(injectedPrompt,/妆容：无/);assert.equal(body.rawCard,text);
+});
+
+test('投递中同聊天正文被编辑时撤销旧提示，不冒充当前版本',async()=>{
+ setup();ctx.chat.push({is_user:true,mes:'继续'});ctx.extensionPrompts={};
+ let first=true;
+ ctx.setExtensionPrompt=async(key,value)=>{
+  ctx.extensionPrompts[key]={value};
+  if(first){first=false;ctx.chat.at(-1).mes='改为离开';}
+ };
+ await assert.rejects(plugin.updateCurrentBodyPrompt(),/版本已变化/);
+ assert.equal(ctx.extensionPrompts.legacy_life_manager_current_body.value,'');
+});
+test('正文新身份与主档冲突时普通生成停止，而非静默发送空档',async()=>{
+ const after=setup();plugin.reconcileConversation();ctx.chat.push({is_user:true,mes:'继续'});
+ after.主角.载体档案.姓名='另一个身体';
+ let stopped=false;await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{stopped=true;},'normal');
+ assert.equal(stopped,true);assert.equal(injectedPrompt,'');
+});
+test('FNV1A HTTP备份在支持SHA的环境也按原算法校验',async()=>{
+ setup();plugin.reconcileConversation();const ledger=structuredClone(ctx.chatMetadata.legacy_life_manager);
+ const payload={format:'sillytavern-legacy-life-backup',version:3,pluginLedger:ledger};
+ const integrity=await plugin.backupDigest(payload,'FNV1A');
+ assert.equal(integrity.algorithm,'FNV1A');
+ await assert.doesNotReject(plugin.importBackupPayload({...payload,integrity},{ask:false}));
+});
+test('整理解锁下一轮前等待完成，失败则停止生成且原文保留',async()=>{
+ setup();ctx.chat=openingMessages();ctx.chat.push({mes:'<gametxt>林晓在画店门前站定。</gametxt>',stat_data:{主角:{种族:'人类',职业:'画师'}}});ctx.chatMetadata={};
+ await plugin.updateCurrentBodyPrompt();ctx.chat.push({is_user:true,mes:'继续'});
+ ctx.generateRaw=async()=>{throw new Error('接口故障');};
+ let stopped=false;await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{stopped=true;},'normal');
+ assert.equal(stopped,true);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.repairs.length,1);
+ ctx.generateRaw=async config=>{const p=JSON.parse(config.prompt);return JSON.stringify({version:1,bodyId:p.bodyId,sourceId:p.sourceId,sourceHash:p.sourceHash,baseVersion:p.baseVersion,reviewed:true,changes:[]});};
+ stopped=false;await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{stopped=true;},'normal');
+ assert.equal(stopped,false);assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.repairs.length,0);
+ assert.ok(injectedPrompt.includes(ctx.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.text));
 });

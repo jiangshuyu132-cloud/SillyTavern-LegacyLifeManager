@@ -100,14 +100,17 @@ export function createMvuAdapter({ env = globalThis, getContext, getLatestMessag
         return {};
     }
 
-    async function writeMessagePath(path, value) {
-        const option = { type: 'message', message_id: 'latest' };
+    async function writeMessagePath(path, value, { messageIndex, assertContext = () => {} } = {}) {
+        assertContext();
+        const option = { type: 'message', message_id: messageIndex ?? 'latest' };
         const updateVariablesWith = callable(env, 'updateVariablesWith');
         if (updateVariablesWith) {
             await Promise.resolve(updateVariablesWith.fn.call(updateVariablesWith.owner, variables => {
+                assertContext();
                 if (!statDataFromVariables(variables)) throw new Error('最新消息楼层没有 MVU 的 stat_data');
                 return setPath(variables, path, value);
             }, option));
+            assertContext();
             return;
         }
 
@@ -118,6 +121,7 @@ export function createMvuAdapter({ env = globalThis, getContext, getLatestMessag
             if (!statDataFromVariables(current)) throw new Error('最新消息楼层没有 MVU 的 stat_data');
             const next = setPath(clone(current, env), path, value);
             await Promise.resolve(replaceVariables.fn.call(replaceVariables.owner, next, option));
+            assertContext();
             return;
         }
 
@@ -127,17 +131,19 @@ export function createMvuAdapter({ env = globalThis, getContext, getLatestMessag
             if (!statDataFromVariables(current)) throw new Error('最新消息楼层没有 MVU 的 stat_data');
             const next = setPath(clone(current, env), path, value);
             await Promise.resolve(mvu.replaceMvuData(next, option));
+            assertContext();
             return;
         }
 
         const setMessageVar = callable(env, 'setMessageVar');
         if (setMessageVar) {
+            if (messageIndex !== undefined) throw new Error('旧版变量接口不能锁定精确楼层，请更新酒馆助手后重试资金继承');
             await Promise.resolve(setMessageVar.fn.call(setMessageVar.owner, path, value));
             return;
         }
 
         const ctx = getContext();
-        const message = ctx?.chat?.[getLatestMessageIndex()];
+        const message = ctx?.chat?.[messageIndex ?? getLatestMessageIndex()];
         if (!message) throw new Error('找不到可写入的最新消息变量');
         const statData = statDataFromMessage(message) || readStatData();
         if (!Object.keys(statData).length) throw new Error('没有检测到 MVU 的 stat_data；请确认已安装并启用酒馆助手/MVU');
@@ -146,6 +152,7 @@ export function createMvuAdapter({ env = globalThis, getContext, getLatestMessag
         message.variables ??= {};
         message.variables.stat_data = next;
         await Promise.resolve(ctx.saveChat?.());
+        assertContext();
     }
 
     function readStatDataAt(index) {

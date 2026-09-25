@@ -828,6 +828,7 @@ export function carrierRecordKey(record, messages = []) {
     const confirmationIdentity = confirmation.send_date
         || confirmation.gen_started
         || confirmation.extra?.gen_id
+        || confirmation.legacy_life_source_id
         || `${record.confirmationIndex}:${String(confirmation.mes || '').trim()}`;
     return `${stableTextFingerprint(record.card)}:${stableTextFingerprint(confirmationIdentity)}`;
 }

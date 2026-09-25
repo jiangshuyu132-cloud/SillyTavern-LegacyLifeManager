@@ -38,11 +38,11 @@ function splitFields(content) {
     return fields;
 }
 
-function documentFrom(body) {
+export function documentFrom(body) {
     return originalSections(body).map(s => ({ ...s, fields: splitFields(s.content), changed: false, sources: [] }));
 }
 
-function applyChange(sections, change, source) {
+export function applyChange(sections, change, source) {
     const section = sections.find(s => s.title === change.section);
     if (!section) return;
     if (change.field === '完整描述') {
@@ -89,7 +89,7 @@ function messageKey(message, index) {
     return clean(message?.extra?.message_id || message?.send_date) || `floor:${index}`;
 }
 
-function validateBlock(block, body, sections, evidence) {
+export function validateBlock(block, body, sections, evidence) {
     if (block?.version !== 1 || block.bodyId !== dossierBodyId(body) || !Array.isArray(block.changes)) throw new Error('档案更新的身体标识或格式不符');
     if (block.changes.length > 80) throw new Error('单轮档案更新项目过多');
     const changes = [], rejected = [];

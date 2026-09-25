@@ -39,18 +39,23 @@ import {
     upsertArchive,
 } from './core.js';
 import { createMvuAdapter } from './mvu-adapter.js';
-import { resolveDynamicDossier, dossierUpdateInstructions } from './dossier.js';
 import { initialOpeningRecord, openingMatchesCurrent } from './opening.js';
+import { observeSources, projectSources, refsPresent, bindBody, captureIdentityCheckpoint } from './source-ledger.js';
+import { resolveDossier, installRestoreCheckpoint } from './dossier-store.js';
+import { createDossierUpdater } from './updater.js';
 
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
 const PROMPT_KEY = 'legacy_life_manager_current_body';
-const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 13, injectionMode: 'strict', floatingPosition: null });
+const DEFAULT_SETTINGS = Object.freeze({ worldBookName: '', dataVersion: 14, injectionMode: 'strict', floatingPosition: null, independentUpdates: true });
 const RUNTIME_TOKEN = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 let initialized = false;
 let archiveInFlight = false;
 let moneyInheritanceInFlight = false;
 let refreshTimers = [];
+let refreshFlight = Promise.resolve();
+let storyGenerating = false;
+let updaterStatus = { state: 'idle' };
 const sharedRuntime = globalThis.__legacyLifeManagerRuntime ??= { notification: { key: '', at: 0 }, token: '' };
 let lastPromptText = '';
 let lastPromptStats = { characters: 0, tokenLow: 0, tokenHigh: 0, requestedMode: 'strict', effectiveMode: '等待当前身体', injected: false, sourceFloor: 0, appliedOperations: 0 };
@@ -104,6 +109,12 @@ function settings() {
         current.dataVersion = 13;
         ctx.saveSettingsDebounced?.();
     }
+    if (Number(current.dataVersion || 0) < 14) {
+        current.independentUpdates = true;
+        current.dataVersion = 14;
+        ctx.saveSettingsDebounced?.();
+    }
+    current.independentUpdates ??= true;
     if (!['strict', 'smart', 'full', 'compact', 'off'].includes(current.injectionMode)) current.injectionMode = 'strict';
     return current;
 }
@@ -112,18 +123,19 @@ function chatData(create = true) {
     const ctx = context();
     if (!ctx?.chatMetadata) return null;
     if (!ctx.chatMetadata[METADATA_KEY] && create) {
-        ctx.chatMetadata[METADATA_KEY] = { version: 13, currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
+        ctx.chatMetadata[METADATA_KEY] = { version: 14, protocolVersion: 'dusk.1', currentBody: null, lives: [], suppressedRecordKeys: [], pendingSnapshot: null, backups: [], portraits: {}, moneyInheritance: {}, trustedCarrierRecordKeys: [] };
     }
     const data = ctx.chatMetadata[METADATA_KEY] || null;
     if (data) {
         const previousVersion = Number(data.version || 0);
+        if (previousVersion < 14) data.preVersionedBackup ??= { at: new Date().toISOString(), data: structuredClone(data) };
         if (data.protocolVersion !== 'dusk.1') {
             // Permanent one-time copy: stricter proof must not destroy a legacy ledger.
             data.legacyMigrationBackup ??= {at:new Date().toISOString(),data:structuredClone(data)};
             data.protocolVersion='dusk.1';
             ctx.saveMetadataDebounced?.();
         }
-        data.version = 13;
+        data.version = 14;
         data.lives ??= [];
         data.currentBody ??= null;
         data.suppressedRecordKeys ??= [];
@@ -147,7 +159,7 @@ function chatData(create = true) {
             if (recordKey && receipt?.status === 'applied') trustedKeys.add(recordKey);
         }
         data.trustedCarrierRecordKeys = [...trustedKeys].slice(-50);
-        if (previousVersion < 13 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
+        if (previousVersion < 14 || previousTrustedKeys !== JSON.stringify(data.trustedCarrierRecordKeys)) {
             ctx.saveMetadataDebounced?.();
         }
     }
@@ -185,12 +197,27 @@ function latestMessageIndex() {
 const mvu = createMvuAdapter({ env: globalThis, getContext: context, getLatestMessageIndex: latestMessageIndex });
 const readStatData = () => mvu.readStatData();
 
-function protocolMessages() {
+function rawProtocolMessages() {
     return (context()?.chat || []).map((message,index) => {
         if (messageStat(message)) return message;
         const stat=mvu.readStatDataAt(index);
         return stat ? {...message, stat_data:stat} : message;
     });
+}
+
+function observeConversation(reason = '', targetIndex) {
+    const data = chatData();
+    if (!data || !activeChat()) return null;
+    const result = observeSources(data.sourceLedger, context().chat, { reason, targetIndex, variablesAt: index => mvu.readStatDataAt(index) });
+    data.sourceLedger = result.state;
+    if (result.changed || result.stamped) saveChatMetadata();
+    return result;
+}
+
+function protocolMessages() {
+    const raw = rawProtocolMessages();
+    const sources = chatData(false)?.sourceLedger?.active;
+    return sources?.length === raw.length ? projectSources(raw, sources, chatData(false)?.sourceLedger?.staleSnapshots) : raw;
 }
 
 function readEffectiveStatData() {
@@ -207,7 +234,7 @@ function readEffectiveStatData() {
             break;
         }
     }
-    const stored = timeline.at(-1) || readStatData() || {};
+    const stored = timeline.at(-1) || (Object.keys(chatData(false)?.sourceLedger?.staleSnapshots || {}).length ? {} : readStatData()) || {};
     const replayed = replayDynamicStatData(stored, messages, {
         startIndex: storedMessageIndex + 1,
         allowOperation: isSafeRuntimePatch,
@@ -276,14 +303,15 @@ function bodyFromConfirmedRecord(record, messages, lives, previous = null) {
         backgroundStory: carrierBackgroundStory(record.card),
         sourceMessageIndex: record.cardIndex,
         confirmationMessageIndex: record.confirmationIndex,
+        commitMessageIndex: record.commitIndex,
         sourceCardFingerprint: stableTextFingerprint(record.card),
         sourceRecordKey,
         sourceType: 'conversation',
         startMessageIndex: record.confirmationIndex,
         generation: carrierGeneration(record.card, Math.max(1, ...lives.map(item => Number(item.generation) + 1).filter(Number.isFinite))),
         confirmed: true,
-        importedAt: previous?.sourceRecordKey === sourceRecordKey ? previous.importedAt : new Date().toISOString(),
-        ...(previous?.sourceRecordKey === sourceRecordKey && previous?.dynamicDossier ? { dynamicDossier: structuredClone(previous.dynamicDossier) } : {}),
+        importedAt: previous?.importedAt || new Date().toISOString(),
+        ...(previous?.dynamicDossier ? { dynamicDossier: structuredClone(previous.dynamicDossier) } : {}),
     };
 }
 
@@ -294,6 +322,10 @@ function recoverableSavedLedger(data, currentState) {
     ];
     for (const candidate of candidates) {
         const body = candidate.body;
+        if ((data?.suppressedRecordKeys || []).includes(body?.sourceRecordKey)) continue;
+        if ((data?.revokedRecordKeys || []).includes(body?.sourceRecordKey)) continue;
+        if (!body?.sourceAnchors?.length) continue;
+        if (body?.sourceAnchors?.length && !refsPresent(body.sourceAnchors, data.sourceLedger?.active || [])) continue;
         if (!body?.rawCard || !Object.keys(asObject(body.profile)).length) continue;
         if (body.confirmed === false || (body.sourceType && body.sourceType !== 'conversation')) continue;
         if (!carrierProfileMatchesCurrentState(currentState, body.profile, 2)) continue;
@@ -305,51 +337,75 @@ function recoverableSavedLedger(data, currentState) {
     return null;
 }
 
-function reconcileConversation({ force = false, reason = '自动对账' } = {}) {
+function reconcileConversation({ force = false, reason = '自动对账', targetIndex } = {}) {
     const data = chatData();
+    if (!data || !activeChat()) return { changed: false };
+    const observation = observeConversation(reason, targetIndex);
+    const sources = data.sourceLedger.active;
     const messages = protocolMessages();
     const truth = conversationLedgerTruth(messages, force ? [] : data.suppressedRecordKeys, trustedCarrierOptions(data));
     const records = truth.records;
     const record = truth.currentRecord;
     const previous = data.currentBody;
+    const destructive = ['MESSAGE_DELETED', 'MESSAGE_EDITED', 'MESSAGE_UPDATED', 'MESSAGE_SWIPED'].includes(reason);
+    const revoked = previous && (previous.sourceAnchors?.length
+        ? !refsPresent(previous.sourceAnchors, sources)
+        : (destructive || observation?.removed.length || observation?.revised.length) && !record);
+    if (revoked) {
+        data.revokedRecordKeys = [...new Set([...(data.revokedRecordKeys || []), previous.sourceRecordKey])].filter(Boolean);
+        captureIdentityCheckpoint(data, previous);
+        data.lastRollback = { at: new Date().toISOString(), reason, name: previous.profile?.姓名 || '', externalArchivesUntouched: true };
+    }
     let nextLives = truth.lives;
-    let nextBody = record ? bodyFromConfirmedRecord(record, messages, nextLives, previous) : null;
+    const cached = record ? data.identityCheckpoints?.[carrierRecordKey(record, messages)]?.body : null;
+    const sameLegacyBody = record && !revoked && previous?.sourceCardFingerprint === stableTextFingerprint(record.card)
+        && Number(previous.generation) === carrierGeneration(record.card, 1);
+    const matchingPrevious = previous?.sourceRecordKey === carrierRecordKey(record, messages) || sameLegacyBody ? previous : cached;
+    let nextBody = record ? bindBody(bodyFromConfirmedRecord(record, messages, nextLives, matchingPrevious), sources,
+        [record.cardIndex, record.confirmationIndex, record.commitIndex]) : null;
     let savedRecovery = null;
+    if (sameLegacyBody && previous.sourceRecordKey !== nextBody.sourceRecordKey && data.moneyInheritance?.[previous.sourceRecordKey]) {
+        data.moneyInheritance[nextBody.sourceRecordKey] = structuredClone(data.moneyInheritance[previous.sourceRecordKey]);
+    }
     const opening = initialOpeningRecord(messages);
     if (!record && opening && (force || !(data.suppressedRecordKeys || []).includes(opening.sourceRecordKey))
-        && (!previous || previous.sourceType === 'opening')
-        && !(data.lives || []).length && !data.trustedCarrierRecordKeys?.length
+        && (!previous || revoked || previous.sourceType === 'opening')
         && openingMatchesCurrent(opening, messages, readEffectiveStatData().statData)) {
-        nextBody = previous?.sourceRecordKey === opening.sourceRecordKey ? previous
-            : { ...opening, importedAt: new Date().toISOString() };
+        nextBody = previous?.sourceRecordKey === opening.sourceRecordKey && !revoked ? previous
+            : bindBody({ ...opening, importedAt: new Date().toISOString() }, sources, [opening.sourceMessageIndex]);
     }
-    if (!nextBody && !record && !force) {
+    if (!nextBody && !record && !force && !revoked) {
         // A normal page refresh is not proof that the source was deleted.
         // Long imported chats can expose only the active swipe or omit older
         // message bodies while they are still loading. Never destroy a body
         // already confirmed by this plugin merely because one scan is empty.
-        if (previous?.rawCard && previous?.profile) {
+        if (previous?.rawCard && previous?.profile && !(data.revokedRecordKeys || []).includes(previous.sourceRecordKey)) {
             nextBody = previous;
             nextLives = data.lives || [];
         } else {
-            savedRecovery = recoverableSavedLedger(data, trustedCarrierOptions(data).currentState);
+            savedRecovery = destructive || observation?.removed.length ? null : recoverableSavedLedger(data, trustedCarrierOptions(data).currentState);
             if (savedRecovery) {
                 nextBody = savedRecovery.body;
                 nextLives = mergeLifeRecords(savedRecovery.lives, data.lives || []);
             }
         }
     }
+    if (previous?.explicitRestore && !revoked && !force && (!record || record.cardIndex <= previous.startMessageIndex)) {
+        nextBody = previous; nextLives = data.lives || [];
+    }
     const remembered = record ? rememberTrustedCarrierRecord(data, record, messages) : false;
 
     const previousKey = previous?.sourceRecordKey || previous?.sourceCardFingerprint
         || (previous?.rawCard ? stableTextFingerprint(previous.rawCard) : '');
     const nextKey = nextBody?.sourceRecordKey || nextBody?.sourceCardFingerprint || '';
-    const changed = previousKey !== nextKey || JSON.stringify(data.lives || []) !== JSON.stringify(nextLives);
+    const changed = previousKey !== nextKey || JSON.stringify(previous?.sourceAnchors) !== JSON.stringify(nextBody?.sourceAnchors)
+        || JSON.stringify(data.lives || []) !== JSON.stringify(nextLives);
     if (!changed) {
         if (remembered) saveChatMetadata();
         return { changed: false, cleared: false, restored: false };
     }
 
+    captureIdentityCheckpoint(data, previous);
     backupLedger(data, reason);
     data.currentBody = nextBody;
     data.lives = nextLives;
@@ -382,12 +438,62 @@ function currentImportedBody() {
 
 function effectiveDossier(body, statData, options = {}) {
     if (!body) return null;
-    const result = resolveDynamicDossier(body, context()?.chat || [], statData, options);
+    observeConversation();
+    const messages = protocolMessages();
+    const timeline = protocolTimeline(messages, { recoverMissingProtocol: true });
+    const result = resolveDossier(body, chatData(false)?.sourceLedger?.active || [], { variablesAt: index => timeline[index] || {} });
     if (result.changed) {
         body.dynamicDossier = result.state;
         if (body === currentImportedBody()) saveChatMetadata();
     }
     return result;
+}
+
+function captureUpdate() {
+    if (!activeChat()) return null;
+    reconcileConversation({ reason: '整理前核对来源' });
+    const ctx = context(), data = chatData(false), body = currentImportedBody();
+    if (!body) return null;
+    const result = effectiveDossier(body, readEffectiveStatData().statData);
+    return { ctx, data, body, result, metadata: ctx.chatMetadata, chatId: String(ctx.chatId || ctx.groupId),
+        signature: data.sourceLedger.signature, sourceCount: data.sourceLedger.active.length, token: sharedRuntime.token,
+        generate: typeof ctx.generateRaw === 'function' ? config => ctx.generateRaw(config) : null };
+}
+
+const dossierUpdater = createDossierUpdater({
+    capture: captureUpdate,
+    current(snapshot) {
+        const ctx = context();
+        if (!snapshot || ctx?.chatMetadata !== snapshot.metadata || String(ctx?.chatId || ctx?.groupId) !== snapshot.chatId
+            || sharedRuntime.token !== snapshot.token || currentImportedBody() !== snapshot.body) return false;
+        observeConversation();
+        const prefix = chatData(false)?.sourceLedger?.active.slice(0, snapshot.sourceCount) || [];
+        return stableTextFingerprint(JSON.stringify(prefix.map(s => [s.id, s.hash, s.swipe, s.isUser]))) === snapshot.signature;
+    },
+    async save(snapshot) {
+        if (context()?.chatMetadata !== snapshot.metadata) throw new Error('聊天已经切换，整理结果未保存');
+        // saveMetadata saves the chat with its message IDs and metadata together.
+        if (typeof snapshot.ctx.saveMetadata === 'function') await snapshot.ctx.saveMetadata();
+        else if (typeof snapshot.ctx.saveChat === 'function') await snapshot.ctx.saveChat();
+        else snapshot.ctx.saveMetadataDebounced?.();
+    },
+    onStatus(state, task, error) {
+        updaterStatus = { state, sourceIndex: task.sourceIndex, error: error?.message || '' };
+        void render().catch(error => console.error('[历代人生管理器] 整理状态显示失败', error));
+    },
+});
+
+async function synchronizeDossier({ manual = false, beforeGeneration = false } = {}) {
+    if ((!manual && (!settings().independentUpdates || settings().injectionMode === 'off')) || !currentImportedBody()) return;
+    if (storyGenerating && !beforeGeneration) throw new Error('正文还在生成，请等正文结束后再整理');
+    let result;
+    try { result = await dossierUpdater.run({ limit: 3 }); }
+    finally { await render(); } // Clear the busy button on failures as well.
+    if (result.stale) throw new Error('聊天、身体或消息版本已变化，过期整理结果未提交，请重试');
+    await updateCurrentBodyPrompt();
+    await render();
+    if (result.remaining) throw new Error(`本次已核对 ${result.completed} 层，还剩 ${result.remaining} 层。为避免大量历史请求连续计费，请在插件中点击“整理/重试待同步档案”继续。`);
+    if (manual) notify('success', '动态档案核对完成，完整版本已写入酒馆提示区');
 }
 
 async function applyMoneyInheritance() {
@@ -400,12 +506,21 @@ async function applyMoneyInheritance() {
     if (!key || data.moneyInheritance?.[key]?.status === 'applied') return false;
     const transition = crossLifeMoneyTransition(messages, record);
     if (!transition) return false;
+    const ctx = context(), metadata = ctx.chatMetadata, messageIndex = latestMessageIndex();
+    const target = ctx.chat[messageIndex], signature = data.sourceLedger?.signature;
+    const assertContext = () => {
+        if (context()?.chatMetadata !== metadata || context()?.chat?.[messageIndex] !== target
+            || latestMessageIndex() !== messageIndex) throw new Error('资金继承期间聊天或目标楼层已变化，未确认提交');
+        observeConversation();
+        if (signature && data.sourceLedger.signature !== signature) throw new Error('资金继承期间正文已修改，未确认提交');
+    };
 
     moneyInheritanceInFlight = true;
     try {
         if (transition.needsRestore) {
-            await mvu.writeMessagePath('stat_data.主角.金钱', transition.adjustedMoney);
-            const verified = normalizedMoney(mvu.readStatData()?.主角?.金钱);
+            await mvu.writeMessagePath('stat_data.主角.金钱', transition.adjustedMoney, { messageIndex, assertContext });
+            assertContext();
+            const verified = normalizedMoney(mvu.readStatDataAt(messageIndex)?.主角?.金钱);
             if (!Object.is(verified, transition.adjustedMoney)) throw new Error('跨世金钱写入后回读不一致');
         }
         data.moneyInheritance[key] = {
@@ -511,7 +626,11 @@ async function removeCurrentPortrait() {
 }
 
 function dynamicContextText(statData, fullCarrier = false) {
-    return JSON.stringify(liveBodyState(statData, { fullCarrier }), null, 2);
+    const live = liveBodyState(statData);
+    // Detailed body fields have one writer: the versioned dossier. A stale MVU
+    // mirror must not reintroduce deleted makeup/clothing through this block.
+    const keys = ['当前地点', '等级', '属性', '生命值', '法力值', '体力值', '状态效果'];
+    return JSON.stringify(Object.fromEntries(keys.filter(k => live[k] !== undefined).map(k => [k, live[k]])), null, 2);
 }
 
 function buildCurrentBodyPrompt(body, statData, mode) {
@@ -571,7 +690,13 @@ function buildCurrentBodyPrompt(body, statData, mode) {
         .replace('<legacy_life_current_body>', '<legacy_life_current_body authority="confirmed-plugin-dossier-first">')
         .replace('\n\n【行动—人格协调规则', `\n\n${authorityRules}\n\n【行动—人格协调规则`);
     const guardedPrompt = authoritativePrompt.replace('\n\n【行动—人格协调规则', `\n\n${moneyRule}\n\n【行动—人格协调规则`);
-    const finalPrompt = guardedPrompt.replace('</legacy_life_current_body>', `\n\n${dossierUpdateInstructions(body, dossier)}\n</legacy_life_current_body>`);
+    const maintenance = `【档案维护分工】\n当前动态主档版本：${dossier.state.revision}。身体详细变化由正文结束后的独立整理步骤维护。正文模型只负责剧情及原有 MVU 变量协议，不再输出 LegacyBodyUpdate，不修改主档副本或动态身体档案镜像；不能为追求同步而编造变化。物品、金钱、任务、人物关系及状态数值仍照常更新。化妆、换衣、身体与认知变化应在正文明确表达实际完成结果。简短变量中的旧身体细节不能覆盖本动态主档。`;
+    const rollback = Object.keys(chatData(false)?.sourceLedger?.staleSnapshots || {}).length
+        ? '\n【删改后的变量核对】本聊天发生过删改，部分旧 MVU 累计快照尚未重新计算。插件已跳过这些快照，按保留正文重算上面的动态覆盖。若其他 status_current_variables 与此处冲突，本轮以本插件重算值为准，不复活已删剧情；其他不冲突的物品、任务和关系仍照常读取。' : '';
+    const finalPrompt = guardedPrompt
+        .replace('它已经实际进入本轮 AI 上下文，不是只供插件界面显示的记录', '插件将这份完整档案提交到本轮生成提示，不仅供界面显示')
+        .replace('伤势、疾病是否仍生效、卫生、穿着、形态、改造、位置、资源和数值必须按这里的当前值续写', '状态是否仍生效、位置、资源和数值以此处为准；卫生、妆容、穿着、形态和身体改造的详细描述读取上面的完整动态主档')
+        .replace('</legacy_life_current_body>', `\n\n${maintenance}${rollback}\n</legacy_life_current_body>`);
     return { prompt: finalPrompt, effectiveMode };
 }
 
@@ -608,14 +733,32 @@ async function updateCurrentBodyPrompt() {
     const { statData } = runtimeInfo;
     const requestedMode = settings().injectionMode || 'strict';
     const built = buildCurrentBodyPrompt(currentImportedBody(), statData, requestedMode);
+    const metadata = ctx.chatMetadata;
+    const signature = chatData(false)?.sourceLedger?.signature;
+    const dossierVersion = currentImportedBody()?.dynamicDossier?.revision;
     try {
         await ctx.setExtensionPrompt(PROMPT_KEY, built.prompt, 1, 0, false, 0);
+        if (context()?.chatMetadata === metadata) observeConversation();
+        if (context()?.chatMetadata !== metadata || chatData(false)?.sourceLedger?.signature !== signature
+            || currentImportedBody()?.dynamicDossier?.revision !== dossierVersion) {
+            if (context()?.extensionPrompts?.[PROMPT_KEY]?.value === built.prompt) await context()?.setExtensionPrompt?.(PROMPT_KEY, '', 1, 0, false, 0);
+            throw new Error('投递期间聊天、正文或档案版本已变化，旧档案投递已撤销');
+        }
         if (ctx.extensionPrompts && ctx.extensionPrompts[PROMPT_KEY]?.value !== built.prompt) throw new Error('酒馆提示区回读内容不一致');
     } catch (error) {
         recordPromptStats('', requestedMode, '投递失败', runtimeInfo, false);
         throw error;
     }
     lastPromptText = built.prompt;
+    const data = chatData(false), dossier = currentImportedBody()?.dynamicDossier;
+    if (data) {
+        data.aiInjectionReceipt = { at: new Date().toISOString(), promptKey: PROMPT_KEY,
+            bodyName: currentImportedBody()?.profile?.姓名 || '', dossierVersion: dossier?.revision || '',
+            promptFingerprint: stableTextFingerprint(built.prompt), characters: built.prompt.length,
+            verified: Boolean(built.prompt && (!ctx.extensionPrompts || ctx.extensionPrompts[PROMPT_KEY]?.value === built.prompt)),
+            pending: dossier?.repairs?.length || 0 };
+        saveChatMetadata();
+    }
     recordPromptStats(built.prompt, requestedMode, built.effectiveMode, runtimeInfo, true);
 }
 
@@ -628,8 +771,20 @@ globalThis.legacyLifeManagerGenerationInterceptor = async (_chat, _size, abort, 
             await context()?.setExtensionPrompt?.(PROMPT_KEY, '', 1, 0, false, 0);
             return;
         }
+        reconcileConversation({ reason: '生成前确认当前分支' });
+        const body = currentImportedBody();
+        const ordinary = !specialGeneration(protocolMessages(), readEffectiveStatData().statData);
+        if (body && ordinary && settings().injectionMode !== 'off') {
+            await synchronizeDossier({ beforeGeneration: true });
+            const pending = effectiveDossier(currentImportedBody(), {})?.tasks.length;
+            if (pending) throw new Error('仍有正文未核对。请启用独立整理并点击“整理/重试待同步档案”；未使用旧档继续生成');
+        }
         await updateCurrentBodyPrompt();
+        if (body && ordinary && settings().injectionMode !== 'off' && !lastPromptText.includes('<legacy_life_current_body ')) {
+            throw new Error('当前身体身份与变量尚未核对一致，未发送缺少主档的普通剧情请求');
+        }
     } catch (error) {
+        storyGenerating = false;
         notify('error', `动态主档投递失败，已暂停本次生成：${error.message}`);
         abort?.(true);
     }
@@ -716,26 +871,27 @@ async function archivePendingLife() {
     } finally { archiveInFlight=false; }
 }
 
-async function backupDigest(payload) {
+async function backupDigest(payload, algorithm = globalThis.crypto?.subtle ? 'SHA-256' : 'FNV1A') {
     const text = JSON.stringify(payload);
-    if (globalThis.crypto?.subtle && typeof TextEncoder === 'function') {
+    if (algorithm === 'SHA-256' && globalThis.crypto?.subtle && typeof TextEncoder === 'function') {
         const bytes = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
         return { algorithm: 'SHA-256', digest: [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('') };
     }
-    return { algorithm: 'FNV1A', digest: stableTextFingerprint(text) };
+    if (algorithm === 'FNV1A') return { algorithm: 'FNV1A', digest: stableTextFingerprint(text) };
+    throw new Error(algorithm === 'SHA-256' ? '此备份需要 SHA-256 校验，请通过 HTTPS 或本机 localhost 打开酒馆后导入' : '备份使用了不支持的校验算法');
 }
 
 async function verifyBackupEnvelope(envelope) {
     if (envelope?.format !== 'sillytavern-legacy-life-backup') throw new Error('这不是历代人生管理器备份文件');
     const version = Number(envelope?.version || 0);
-    if (![1, 2].includes(version)) throw new Error(`不支持的备份版本：${version || '未知'}`);
+    if (![1, 2, 3].includes(version)) throw new Error(`不支持的备份版本：${version || '未知'}`);
     if (!asObject(envelope.pluginLedger).currentBody && !(asObject(envelope.pluginLedger).lives || []).length) {
         throw new Error('备份中没有当前身体或历代人生资料');
     }
     if (version >= 2) {
         const payload = { ...envelope };
         delete payload.integrity;
-        const actual = await backupDigest(payload);
+        const actual = await backupDigest(payload, envelope.integrity?.algorithm);
         if (!envelope.integrity?.digest || envelope.integrity.algorithm !== actual.algorithm || envelope.integrity.digest !== actual.digest) {
             throw new Error('备份完整性校验失败，文件可能被截断或修改');
         }
@@ -764,7 +920,11 @@ function normalizedImportedBody(value) {
 async function importBackupPayload(envelope, { ask = true } = {}) {
     const ctx = context();
     if (!activeChat()) throw new Error('请先打开需要恢复的聊天');
+    const metadata = ctx.chatMetadata, chatId = String(ctx.chatId || ctx.groupId);
+    const sameChat = () => context()?.chatMetadata === metadata && String(context()?.chatId || context()?.groupId) === chatId;
+    const assertContext = () => { if (!sameChat()) throw new Error('导入期间聊天已切换，已停止恢复'); };
     const backupVersion = await verifyBackupEnvelope(envelope);
+    assertContext();
     const importedLedger = asObject(envelope.pluginLedger);
     const importedBody = normalizedImportedBody(importedLedger.currentBody);
     const importedLives = Array.isArray(importedLedger.lives) ? importedLedger.lives : [];
@@ -774,20 +934,25 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
     const crossChat = sourceChat && sourceChat !== '未知聊天' && sourceChat !== targetChat;
     const preview = `备份时间：${exportedAt}\n当前身体：${importedBody?.profile?.姓名 || '无'}\n历代人生：${importedLives.length} 条${crossChat ? '\n\n注意：备份来自另一个聊天。' : ''}\n\n导入前会自动保存当前插件账本；换身档案需要至少两个稳定身份字段一致；开局档案需要相同开局原文和当前身份相符，原文不可用时也需要两个字段。通过核对才恢复并写入 AI 提示区。`;
     if (ask && !globalThis.confirm(`确认导入这份备份？\n\n${preview}`)) return { cancelled: true };
+    dossierUpdater.cancel();
 
     const current = chatData();
     const before = structuredClone(current);
     const beforeSettings = structuredClone(ctx.extensionSettings[EXTENSION_KEY] || DEFAULT_SETTINGS);
     const beforePrompt = lastPromptText;
     const beforeStats = structuredClone(lastPromptStats);
+    reconcileConversation({ reason: '导入前记录当前分支' });
     const liveState = readEffectiveStatData().statData || readStatData() || {};
     const canActivate = Boolean(importedBody && (importedBody.sourceType === 'opening'
         ? openingMatchesCurrent(importedBody, protocolMessages(), liveState)
         : carrierProfileMatchesCurrentState(liveState, importedBody.profile, 2)));
+    // Validate a restore point before changing the ledger. Pending work must
+    // remain pending, never become a supposedly complete imported snapshot.
+    if (canActivate) installRestoreCheckpoint(importedBody, current.sourceLedger?.active || []);
     const importedBackups = Array.isArray(importedLedger.backups) ? importedLedger.backups : [];
     const restorePoint = { at: new Date().toISOString(), reason: '导入外部备份前自动保存', currentBody: before.currentBody, lives: before.lives || [] };
 
-    current.version = 13;
+    current.version = 14;
     current.protocolVersion = 'dusk.1';
     current.lives = mergeLifeRecords(current.lives || [], importedLives);
     current.backups = [...(current.backups || []), restorePoint, ...structuredClone(importedBackups)].slice(-12);
@@ -803,7 +968,11 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
     current.pendingSnapshot ??= structuredClone(importedLedger.pendingSnapshot || null);
     current.legacyMigrationBackup ??= structuredClone(importedLedger.legacyMigrationBackup || null);
     current.lastExternalImport = { at: new Date().toISOString(), exportedAt, sourceChat, backupVersion, activated: canActivate };
-    if (canActivate) current.currentBody = importedBody;
+    if (canActivate) {
+        importedBody.startMessageIndex = (current.sourceLedger?.active.length || 1) - 1;
+        current.currentBody = importedBody;
+        current.revokedRecordKeys = (current.revokedRecordKeys || []).filter(key => key !== importedBody.sourceRecordKey);
+    }
     saveChatMetadata();
 
     if (!canActivate) {
@@ -830,6 +999,7 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
     try {
         if (typeof ctx.setExtensionPrompt !== 'function') throw new Error('酒馆没有提供 AI 上下文注入接口');
         await updateCurrentBodyPrompt();
+        assertContext();
         const bodyName = String(importedBody.profile?.姓名 || '');
         const injected = lastPromptText.includes('<legacy_life_current_body')
             && lastPromptText.includes(bodyName)
@@ -842,21 +1012,27 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
             promptFingerprint: stableTextFingerprint(lastPromptText),
             characters: lastPromptText.length,
             mode: 'strict',
+            dossierVersion: importedBody.dynamicDossier?.revision || '',
+            pending: importedBody.dynamicDossier?.repairs?.length || 0,
             verified: true,
         };
-        saveChatMetadata();
+        if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
+        else saveChatMetadata();
+        assertContext();
     } catch (error) {
         ctx.chatMetadata[METADATA_KEY] = before;
         ctx.extensionSettings[EXTENSION_KEY] = beforeSettings;
-        saveChatMetadata();
+        ctx.saveMetadataDebounced?.();
         saveSettings();
-        try { await ctx.setExtensionPrompt?.(PROMPT_KEY, beforePrompt, 1, 0, false, 0); } catch { /* original error is reported below */ }
-        lastPromptText = beforePrompt;
-        lastPromptStats = beforeStats;
+        if (sameChat()) {
+            try { await ctx.setExtensionPrompt?.(PROMPT_KEY, beforePrompt, 1, 0, false, 0); } catch { /* original error is reported below */ }
+            lastPromptText = beforePrompt;
+            lastPromptStats = beforeStats;
+        }
         throw new Error(`导入已回滚：${error.message}`);
     }
     await render();
-    notify('success', `已恢复“${importedBody.profile.姓名}”，并验证完整人物档案已写入 AI 上下文`);
+    notify('success', `已恢复“${importedBody.profile.姓名}”，并验证完整档案已写入酒馆提示区（不代表模型已接收）`);
     return { imported: true, activated: true, name: importedBody.profile.姓名 };
 }
 
@@ -892,7 +1068,7 @@ async function exportBackup() {
         sendDate: message?.send_date || null,
     }));
     const payload = {
-        format: 'sillytavern-legacy-life-backup', version: 2, exportedAt: new Date().toISOString(),
+        format: 'sillytavern-legacy-life-backup', version: 3, exportedAt: new Date().toISOString(),
         chatId: ctx?.chatId || ctx?.groupId || '', statData, worldBookName: name,
         pluginSettings: {
             worldBookName: String(settings().worldBookName || ''),
@@ -1006,7 +1182,12 @@ function renderFullBody(panel, body, statData) {
         sections.append(details);
     }
     panel.append(heading, intro);
-    if (dossier.state.pending) panel.append(el('div', 'llm-warning', `仍有 ${dossier.state.repairs.length} 条正文待核对（最早第 ${dossier.state.pending.sourceIndex} 楼）。已核对字段已保存；未接收项及完整原文会分批带入普通回复，收到有效修正或明确核对回执后才清除，不把一次空回执当成补齐。`));
+    const receipt = chatData(false)?.aiInjectionReceipt;
+    panel.append(el('div', 'llm-injection-receipt', `主档版本：${dossier.state.revision} · ${dossier.state.frames.length} 条正文已核对 · ${dossier.state.repairs.length} 条待核对\n${receipt?.verified && receipt.dossierVersion === dossier.state.revision ? '同版本完整档案已写入酒馆提示区；不代表模型服务已接收。' : '此版本尚未验证写入提示区。'}`));
+    if (dossier.state.pending) {
+        panel.append(el('div', 'llm-warning', `仍有 ${dossier.state.repairs.length} 条正文待核对（最早第 ${dossier.state.pending.sourceIndex} 楼）。独立整理使用当前酒馆模型接口，每次最多处理 3 层，可能产生额外费用；未完成前会暂停下一次普通剧情生成。`));
+        panel.append(createButton(dossierUpdater.busy ? '正在整理，请稍候' : '整理/重试待同步档案', () => synchronizeDossier({ manual: true }), 'menu_button llm-primary'));
+    }
     for (const issue of dossier.state.issues.slice(0,8)) panel.append(el('div', 'llm-warning', `未接收项：${issue}`));
     if (dossier.state.repairs.length) {
         const diagnostics = document.createElement('details');
@@ -1072,23 +1253,20 @@ function runtimeValueText(value) {
 
 function renderRuntimeBodyState(panel, statData, runtimeInfo = {}) {
     const main = asObject(statData?.主角);
-    const carrier = asObject(main.载体档案);
     const effects = Object.entries(asObject(main.状态效果));
+    // Same ownership as dynamicContextText: detailed mirrors are not shown as
+    // authoritative current values beside the versioned body dossier.
     const changes = [];
-    const wanted = /伤|病|健康|外貌|身体|体型|皮肤|四肢|器官|结构|生理|变异|改造|形态|植入|义体|血脉|特征|疤痕|气味|卫生|体毛|发色|瞳色|身高|体重|尺寸|标记|烙印|诅咒|祝福|穿着|衣着|足部|脚部/;
-    for (const [key, value] of Object.entries(carrier)) {
-        if (wanted.test(key) && runtimeValueText(value)) changes.push([key, value]);
-    }
-    for (const [key, value] of Object.entries(main)) {
-        if (key !== '载体档案' && key !== '状态效果' && wanted.test(key) && runtimeValueText(value)) changes.push([key, value]);
+    for (const [key, value] of Object.entries(JSON.parse(dynamicContextText(statData)))) {
+        if (key !== '状态效果' && runtimeValueText(value)) changes.push([key, value]);
     }
     if (!effects.length && !changes.length && !runtimeInfo.appliedOperations) return;
 
     panel.append(el('h3', 'llm-section-title', '当前有效动态覆盖（实时状态与数值）'));
     const sourceFloor = Number(runtimeInfo?.sourceMessageIndex ?? -1) + 1;
     const note = runtimeInfo.appliedOperations
-        ? `已读取到第 ${sourceFloor} 楼，并从最新正文变量更新中提前补全 ${runtimeInfo.appliedOperations} 项尚待 MVU 落盘的安全变化；这些内容已经加入本轮 AI 上下文。`
-        : `已读取到第 ${sourceFloor} 楼的最新变量快照；伤势、状态、变异、改造、形态、卫生和穿着会随正文更新并加入 AI 上下文。`;
+        ? `已读取到第 ${sourceFloor} 楼，并局部重放 ${runtimeInfo.appliedOperations} 项正文变量更新；状态与数值随主档写入提示区。身体、卫生、妆容和穿着的详细描述由下方动态主档统一维护。`
+        : `已读取到第 ${sourceFloor} 楼的变量快照；这里保留状态和数值，身体、卫生、妆容和穿着的详细描述由下方动态主档统一维护。`;
     panel.append(el('div', 'llm-runtime-note', note));
     const list = el('div', 'llm-runtime-list');
     for (const [name, value] of effects) {
@@ -1207,7 +1385,7 @@ async function renderLives(panel, statData) {
     const name = currentWorldBookName();
     const book = name ? await context()?.loadWorldInfo?.(name) : null;
     const entries = book ? Object.values(normalizeEntries(book)) : [];
-    const summaries = lifeHistorySummaries(protocolMessages(), statData, entries, chatData(false)?.lives || []);
+    const summaries = mergeLifeRecords(chatData(false)?.lives || []);
     const search = document.createElement('input');
     search.className = 'text_pole';
     search.placeholder = '搜索姓名或经历';
@@ -1235,6 +1413,7 @@ async function renderLives(panel, statData) {
         panel.append(createButton('把待归档前世写入世界书', archivePendingLife, 'menu_button llm-primary'));
     }
     panel.append(search, list);
+    if (entries.some(entry => String(entry?.comment || '').startsWith(ARCHIVE_PREFIX))) panel.append(el('div', 'llm-muted', '此处只显示当前分支有效的历代记录。已写入世界书的历史词条不等于当前分支记录，删楼不会自动删除外部世界书；如需撤销其提示影响，请在世界书中停用对应词条。'));
     draw();
 }
 
@@ -1313,11 +1492,18 @@ function renderSettings(panel) {
         createButton('清空本聊天插件记录', clearCurrentChatLedger),
     );
     const safety = el('div', 'llm-safety');
-    safety.textContent = '普通总结、隐藏和刷新不会清空已确认身体。主动“从当前正文重新同步”会严格按当前可见正文重建。外部备份导入后必须通过实时身份核对，并会自动切换严格主档案、回读确认人物资料已写入 AI 上下文。';
+    safety.textContent = '隐藏与总结保留原始来源；删除、编辑、切换回复会撤销失效来源及依赖更新。备份不再自动复活已撤销的身体；明确导入会建立恢复点，之后仍参与删改校验。建议升级、总结和大范围删楼前导出完整备份。';
     const archiveCard = el('section', 'llm-control-card');
     archiveCard.append(label, select, active);
     const aiCard = el('section', 'llm-control-card');
     aiCard.append(injectionLabel, injectionHelp, promptMeter, promptPreview);
+    const updateLabel = el('label', 'llm-label', '正文结束后独立整理动态档案（使用当前模型，增加调用费用）');
+    const updateToggle = document.createElement('input');
+    updateToggle.type = 'checkbox'; updateToggle.checked = settings().independentUpdates !== false;
+    updateToggle.addEventListener('change', () => { settings().independentUpdates = updateToggle.checked; dossierUpdater.cancel(); saveSettings(); });
+    updateLabel.prepend(updateToggle);
+    aiCard.append(updateLabel, el('div', 'llm-muted', '整理失败不覆盖原档，可重试；暂停自动整理后也不会让待同步的旧档冒充最新状态继续剧情。'),
+        createButton('整理/重试待同步档案', () => synchronizeDossier({ manual: true })));
     const importCard = el('section', 'llm-control-card');
     importCard.append(importLabel, importActions);
     const maintenanceCard = el('section', 'llm-control-card');
@@ -1662,6 +1848,7 @@ async function render() {
     reconcileConversation({ reason: '打开或刷新聊天' });
     const runtimeInfo = readEffectiveStatData();
     const statData = runtimeInfo.statData;
+    if (Object.keys(chatData(false)?.sourceLedger?.staleSnapshots || {}).length) panel.append(el('div', 'llm-warning', '检测到删改后的旧 MVU 累计快照。插件已跳过旧快照并按保留正文重算自己的动态覆盖；没有覆盖外部 MVU 数据。正文角色面板如仍显示旧数值，请使用其变量重算功能核对。'));
     if (!Object.keys(asObject(statData)).length) {
         panel.append(el('div', 'llm-warning', '没有检测到 stat_data；无法核实换身提交，暂停候选接管与归档。旧账本迁移备份随导出保留。'));
     }
@@ -1671,7 +1858,8 @@ async function render() {
     }
     if (sync) {
         const hasBody = Boolean(currentImportedBody());
-        sync.textContent = hasBody ? (runtimeInfo.appliedOperations ? '正文已追踪' : currentImportedBody()?.sourceType === 'opening' ? '开局已建档' : '已同步') : '等待人物卡';
+        const dossier = hasBody ? effectiveDossier(currentImportedBody(), statData) : null;
+        sync.textContent = !hasBody ? '等待人物卡' : dossierUpdater.busy ? '正在整理' : dossier?.tasks.length ? `待同步 ${dossier.tasks.length} 层` : '档案已核对';
         sync.dataset.state = hasBody ? 'synced' : 'empty';
         sync.title = runtimeInfo.appliedOperations ? `已从最新正文补全 ${runtimeInfo.appliedOperations} 项动态变化` : '';
     }
@@ -1701,36 +1889,52 @@ function installCardButtons() {
     }
 }
 
-function scheduleRefresh(reason = '正文楼层变化') {
-    const result = reconcileConversation({ reason });
+function scheduleRefresh(reason = '正文楼层变化', targetIndex) {
+    const result = reconcileConversation({ reason, targetIndex });
     if (result.cleared) notify('info', '相关人物卡或确认楼层已不存在，插件已撤销旧身体、历代记录和 AI 注入');
     if (result.restored && result.current?.sourceRecordKey && result.current?.sourceRecordKey !== result.previous?.sourceRecordKey) {
         notify('success', `已自动恢复可信身体档案：${result.current.profile?.姓名 || '当前身体'}`);
     }
-    const body = currentImportedBody();
-    if (body && ['MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED'].includes(reason)) {
-        effectiveDossier(body, readEffectiveStatData().statData, { retractChanged: true, retractDeleted: reason === 'MESSAGE_DELETED' });
-    }
+    const metadata = context()?.chatMetadata;
+    if (currentImportedBody()) effectiveDossier(currentImportedBody(), readEffectiveStatData().statData);
     refreshTimers.forEach(clearTimeout);
-    refreshTimers = [0, 250, 900, 1800].map(delay => setTimeout(async () => {
-        await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
-        await updateCurrentBodyPrompt().catch(error => console.error('[历代人生管理器] 注入失败', error));
-        render().catch(error => console.error('[历代人生管理器] 渲染失败', error));
-        installCardButtons();
-    }, delay));
+    refreshTimers = [setTimeout(() => {
+        refreshFlight = refreshFlight.catch(() => {}).then(async () => {
+            if (context()?.chatMetadata !== metadata) return;
+            await applyMoneyInheritance().catch(error => notify('warning', `跨世金钱继承失败：${error.message}`));
+            if (context()?.chatMetadata !== metadata) return;
+            await updateCurrentBodyPrompt();
+            await render(); installCardButtons();
+        }).catch(error => notify('warning', `同步尚未完成：${error.message}`));
+    }, 0)];
 }
 
 function registerEvents() {
     const ctx = context();
     if (!ctx?.eventSource || !ctx?.eventTypes) return;
-    for (const type of ['CHAT_CHANGED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
-        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => {
-            if (sharedRuntime.token === RUNTIME_TOKEN) scheduleRefresh(type);
+    for (const type of ['CHAT_CHANGED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_UPDATED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
+        if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], targetIndex => {
+            if (sharedRuntime.token !== RUNTIME_TOKEN) return;
+            if (type !== 'MESSAGE_RECEIVED') dossierUpdater.cancel();
+            if (type === 'CHAT_CHANGED') { storyGenerating = false; updaterStatus = { state: 'idle' }; }
+            scheduleRefresh(type, type === 'MESSAGE_DELETED' ? undefined : targetIndex);
         });
     }
-    for (const type of ['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS']) {
+    if (ctx.eventTypes.GENERATION_STARTED) ctx.eventSource.on(ctx.eventTypes.GENERATION_STARTED, (type, _options, dryRun) => {
+        if (sharedRuntime.token === RUNTIME_TOKEN && !dryRun && !['quiet', 'impersonate'].includes(type)) storyGenerating = true;
+    });
+    for (const type of ['GENERATION_ENDED', 'GENERATION_STOPPED']) {
         if (ctx.eventTypes[type]) ctx.eventSource.on(ctx.eventTypes[type], () => {
-            if (sharedRuntime.token === RUNTIME_TOKEN) return updateCurrentBodyPrompt();
+            if (sharedRuntime.token !== RUNTIME_TOKEN || !storyGenerating) return;
+            storyGenerating = false;
+            if (type === 'GENERATION_STOPPED') { dossierUpdater.cancel(); return; }
+            scheduleRefresh(type);
+            const metadata = context()?.chatMetadata;
+            setTimeout(() => {
+                if (context()?.chatMetadata !== metadata || storyGenerating
+                    || specialGeneration(protocolMessages(), readEffectiveStatData().statData)) return;
+                void synchronizeDossier().catch(error => notify('warning', `档案待同步：${error.message}`));
+            }, 0);
         });
     }
 }
@@ -1755,7 +1959,7 @@ export async function init() {
     const observer = new MutationObserver(() => installCardButtons());
     const chat = document.querySelector('#chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
-    console.log('[历代人生管理器] v0.11.1 已加载');
+    console.log('[历代人生管理器] v0.13.0 已加载');
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => init(), { once: true });

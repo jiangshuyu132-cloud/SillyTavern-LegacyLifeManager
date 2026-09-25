@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 const require = createRequire(import.meta.url);
 const root = fileURLToPath(new URL('../', import.meta.url));
-const allowed = new Set(['index.js','core.js','dossier.js','opening.js','strict-protocol.js','mvu-adapter.js','style.css','test/fixtures/dual-dossier.html']);
+const allowed = new Set(['index.js','core.js','dossier.js','dossier-store.js','source-ledger.js','updater.js','opening.js','strict-protocol.js','mvu-adapter.js','style.css','test/fixtures/dual-dossier.html','test/fixtures/transactional-dossier.html']);
 const server = createServer(async (req,res) => {
     const name = new URL(req.url,'http://localhost').pathname.slice(1) || 'test/fixtures/dual-dossier.html';
     if (!allowed.has(name)) {res.writeHead(404);res.end();return;}
@@ -39,6 +39,29 @@ try {
     assert.equal(await page.locator('#legacy-life-manager-root').evaluate(el=>el.scrollWidth<=el.clientWidth+2),true);
     assert.deepEqual(errors,[]);
     console.log('Browser QA passed: dynamic/original separation, prompt equality, narrow layout, no page errors.');
+    await page.goto(`http://127.0.0.1:${server.address().port}/test/fixtures/transactional-dossier.html`);
+    await page.locator('#legacy-life-manager-root').waitFor();
+    await page.getByText('整理/重试待同步档案',{exact:true}).first().click();
+    await page.waitForFunction(()=>qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.repairs.length===0);
+    await page.evaluate(()=>qaReply('林晓涂好了淡红色唇膏。'));
+    await page.waitForFunction(()=>qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.text.includes('妆容：淡红唇妆'));
+    assert.equal(await page.evaluate(()=>qaContext.extensionPrompts.legacy_life_manager_current_body.value.includes(qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.text)),true);
+    const beforeHide=await page.evaluate(()=>qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.text);
+    await page.evaluate(()=>qaHide());
+    assert.equal(await page.evaluate(()=>qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.text),beforeHide);
+    await page.evaluate(()=>qaDeleteLast());
+    await page.waitForFunction(()=>!qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.text.includes('淡红唇妆'));
+    await page.evaluate(()=>qaReply('林晓涂好了淡红色唇膏。',true));
+    await page.getByText('未接收项：模拟接口不可用',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>qaGate()),true);
+    await page.evaluate(()=>{qaFail=false;});
+    await page.getByText('整理/重试待同步档案',{exact:true}).first().click();
+    await page.waitForFunction(()=>qaContext.chatMetadata.legacy_life_manager.currentBody.dynamicDossier.repairs.length===0);
+    assert.equal(await page.evaluate(()=>qaGate()),false);
+    assert.equal(await page.evaluate(()=>qaRequests.every(r=>r.systemPrompt.includes('人物档案整理器') && !r.prompt.includes('LegacyBodyUpdate'))),true);
+    await page.screenshot({path:'/tmp/legacy-transactional-dossier-qa.png',fullPage:true});
+    assert.deepEqual(errors,[]);
+    console.log('Browser QA passed: real event callbacks, automatic dedicated updater, hide preservation, deletion rollback, failure gate, manual retry, prompt version equality.');
 } finally {
     await browser?.close();
     await new Promise(r=>server.close(r));
