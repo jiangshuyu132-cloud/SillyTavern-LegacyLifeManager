@@ -40,6 +40,7 @@ import {
 } from './core.js';
 import { createMvuAdapter } from './mvu-adapter.js';
 import { resolveDynamicDossier, dossierUpdateInstructions } from './dossier.js';
+import { initialOpeningRecord, openingMatchesCurrent } from './opening.js';
 
 const EXTENSION_KEY = 'legacy_life_manager';
 const METADATA_KEY = 'legacy_life_manager';
@@ -314,7 +315,15 @@ function reconcileConversation({ force = false, reason = '自动对账' } = {}) 
     let nextLives = truth.lives;
     let nextBody = record ? bodyFromConfirmedRecord(record, messages, nextLives, previous) : null;
     let savedRecovery = null;
-    if (!record && !force) {
+    const opening = initialOpeningRecord(messages);
+    if (!record && opening && (force || !(data.suppressedRecordKeys || []).includes(opening.sourceRecordKey))
+        && (!previous || previous.sourceType === 'opening')
+        && !(data.lives || []).length && !data.trustedCarrierRecordKeys?.length
+        && openingMatchesCurrent(opening, messages, readEffectiveStatData().statData)) {
+        nextBody = previous?.sourceRecordKey === opening.sourceRecordKey ? previous
+            : { ...opening, importedAt: new Date().toISOString() };
+    }
+    if (!nextBody && !record && !force) {
         // A normal page refresh is not proof that the source was deleted.
         // Long imported chats can expose only the active swipe or omit older
         // message bodies while they are still loading. Never destroy a body
@@ -519,7 +528,9 @@ function buildCurrentBodyPrompt(body, statData, mode) {
     if (body.profile?.姓名) {
         const liveName = String(statData?.主角?.载体档案?.姓名 || statData?.主角?.姓名 || '').trim();
         const nameConflicts = liveName && liveName !== String(body.profile.姓名).trim();
-        const unnamedStateMatches = !liveName && carrierProfileMatchesCurrentState(statData, body.profile, 2);
+        const openingMatches = body.sourceType === 'opening' && openingMatchesCurrent(body, protocolMessages(), statData);
+        if (body.sourceType === 'opening' && !openingMatches) return { prompt: '', effectiveMode: '等待开局身份核对' };
+        const unnamedStateMatches = !liveName && (openingMatches || carrierProfileMatchesCurrentState(statData, body.profile, 2));
         if (nameConflicts || (!liveName && !unnamedStateMatches)) return {prompt:'',effectiveMode:'等待MVU当前身体同步'};
     }
     const messages = protocolMessages();
@@ -745,7 +756,7 @@ function normalizedImportedBody(value) {
         sections: Array.isArray(body.sections) ? structuredClone(body.sections) : carrierCardSections(rawCard),
         backgroundStory: String(body.backgroundStory || carrierBackgroundStory(rawCard) || ''),
         confirmed: true,
-        sourceType: 'conversation',
+        sourceType: body.sourceType === 'opening' ? 'opening' : 'conversation',
         sourceCardFingerprint: body.sourceCardFingerprint || stableTextFingerprint(rawCard),
     };
 }
@@ -761,7 +772,7 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
     const sourceChat = String(envelope.chatId || '未知聊天');
     const targetChat = String(ctx.chatId || ctx.groupId || '');
     const crossChat = sourceChat && sourceChat !== '未知聊天' && sourceChat !== targetChat;
-    const preview = `备份时间：${exportedAt}\n当前身体：${importedBody?.profile?.姓名 || '无'}\n历代人生：${importedLives.length} 条${crossChat ? '\n\n注意：备份来自另一个聊天。' : ''}\n\n导入前会自动保存当前插件账本；只有与当前实时身体至少两个稳定身份字段一致，才会恢复为当前身体并写入 AI 上下文。`;
+    const preview = `备份时间：${exportedAt}\n当前身体：${importedBody?.profile?.姓名 || '无'}\n历代人生：${importedLives.length} 条${crossChat ? '\n\n注意：备份来自另一个聊天。' : ''}\n\n导入前会自动保存当前插件账本；换身档案需要至少两个稳定身份字段一致；开局档案需要相同开局原文和当前身份相符，原文不可用时也需要两个字段。通过核对才恢复并写入 AI 提示区。`;
     if (ask && !globalThis.confirm(`确认导入这份备份？\n\n${preview}`)) return { cancelled: true };
 
     const current = chatData();
@@ -770,7 +781,9 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
     const beforePrompt = lastPromptText;
     const beforeStats = structuredClone(lastPromptStats);
     const liveState = readEffectiveStatData().statData || readStatData() || {};
-    const canActivate = Boolean(importedBody && carrierProfileMatchesCurrentState(liveState, importedBody.profile, 2));
+    const canActivate = Boolean(importedBody && (importedBody.sourceType === 'opening'
+        ? openingMatchesCurrent(importedBody, protocolMessages(), liveState)
+        : carrierProfileMatchesCurrentState(liveState, importedBody.profile, 2)));
     const importedBackups = Array.isArray(importedLedger.backups) ? importedLedger.backups : [];
     const restorePoint = { at: new Date().toISOString(), reason: '导入外部备份前自动保存', currentBody: before.currentBody, lives: before.lives || [] };
 
@@ -785,7 +798,7 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
     current.trustedCarrierRecordKeys = [...new Set([
         ...(Array.isArray(importedLedger.trustedCarrierRecordKeys) ? importedLedger.trustedCarrierRecordKeys : []),
         ...(Array.isArray(current.trustedCarrierRecordKeys) ? current.trustedCarrierRecordKeys : []),
-        importedBody?.sourceRecordKey,
+        importedBody?.sourceType === 'conversation' ? importedBody.sourceRecordKey : null,
     ].filter(Boolean))].slice(-100);
     current.pendingSnapshot ??= structuredClone(importedLedger.pendingSnapshot || null);
     current.legacyMigrationBackup ??= structuredClone(importedLedger.legacyMigrationBackup || null);
@@ -795,7 +808,7 @@ async function importBackupPayload(envelope, { ask = true } = {}) {
 
     if (!canActivate) {
         await render();
-        notify('warning', `备份已安全保存，但未替换当前身体：实时姓名、种族或职业不足两项一致。资料可在插件备份中保留。`);
+        notify('warning', '备份已安全保存，但未替换当前身体：开局来源或实时身份核对未通过。资料可在插件备份中保留。');
         return { imported: true, activated: false };
     }
 
@@ -969,6 +982,8 @@ async function clearCurrentChatLedger() {
     const messages = protocolMessages();
     backupLedger(data, '手动清空本聊天插件记录');
     data.suppressedRecordKeys = confirmedCarrierRecords(messages, trustedCarrierOptions(data)).map(record => carrierRecordKey(record, messages));
+    const opening = initialOpeningRecord(messages);
+    if (opening) data.suppressedRecordKeys.push(opening.sourceRecordKey);
     data.currentBody = null;
     data.lives = [];
     saveChatMetadata();
@@ -1656,7 +1671,7 @@ async function render() {
     }
     if (sync) {
         const hasBody = Boolean(currentImportedBody());
-        sync.textContent = hasBody ? (runtimeInfo.appliedOperations ? '正文已追踪' : '已同步') : '等待人物卡';
+        sync.textContent = hasBody ? (runtimeInfo.appliedOperations ? '正文已追踪' : currentImportedBody()?.sourceType === 'opening' ? '开局已建档' : '已同步') : '等待人物卡';
         sync.dataset.state = hasBody ? 'synced' : 'empty';
         sync.title = runtimeInfo.appliedOperations ? `已从最新正文补全 ${runtimeInfo.appliedOperations} 项动态变化` : '';
     }

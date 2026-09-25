@@ -530,7 +530,16 @@ export function currentBehaviorProfile(card, statData = {}, options = {}) {
 export function carrierCardSections(card) {
     const text = carrierCardText(card);
     if (!text) return [];
-    const headings = [...text.matchAll(/^\s*[—-]\s*([^\n—-]{2,40}?)\s*[—-]\s*$/gm)];
+    let headings = [...text.matchAll(/^[ \t]*[—-][ \t]*([^\n—-]{2,40}?)[ \t]*[—-][ \t]*$/gm)];
+    if (!headings.length) {
+        const markdown = [...text.matchAll(/^[ \t]*(#{1,6})[ \t]+([^\n]+)$/gm)];
+        // Some opening cards use ## 一、… followed by # 二、…. Their
+        // numbered chapters are peers; skill/NPC subheadings stay inside them.
+        const numbered = markdown.filter(m => /^[一二三四五六七八九十百\d]+[、.．][ \t]*\S/.test(m[2]));
+        const depth = Math.min(...markdown.map(m => m[1].length));
+        const selected = numbered.length >= 2 ? numbered : markdown.filter(m => m[1].length === depth);
+        headings = selected.map(m => Object.assign([m[0], m[2].replace(/^[一二三四五六七八九十百\d]+[、.．][ \t]*/, '').replace(/[ \t]+#+[ \t]*$/, '').trim()], { index: m.index }));
+    }
     if (!headings.length) return [{ title: '完整人物资料', content: text }];
     const sections = [];
     const preamble = text.slice(0, headings[0].index).trim();
@@ -551,7 +560,7 @@ export function carrierCardSections(card) {
  */
 export function carrierBackgroundStory(card) {
     const sections = carrierCardSections(card);
-    const section = sections.find(item => /^(?:人生背景|背景故事|生平经历|成长经历)$/.test(String(item?.title || '').trim()));
+    const section = sections.find(item => /^(?:人生背景|背景故事|生平经历|成长经历|人物小传|人物背景)$/.test(String(item?.title || '').trim()));
     if (section?.content) return section.content.trim();
     for (const label of ['人生背景', '背景故事', '原主关键人生', '生平经历', '成长经历']) {
         const value = carrierField(card, label);

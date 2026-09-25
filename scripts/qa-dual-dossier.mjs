@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 const require = createRequire(import.meta.url);
 const root = fileURLToPath(new URL('../', import.meta.url));
-const allowed = new Set(['index.js','core.js','dossier.js','strict-protocol.js','mvu-adapter.js','style.css','test/fixtures/dual-dossier.html']);
+const allowed = new Set(['index.js','core.js','dossier.js','opening.js','strict-protocol.js','mvu-adapter.js','style.css','test/fixtures/dual-dossier.html']);
 const server = createServer(async (req,res) => {
     const name = new URL(req.url,'http://localhost').pathname.slice(1) || 'test/fixtures/dual-dossier.html';
     if (!allowed.has(name)) {res.writeHead(404);res.end();return;}

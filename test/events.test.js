@@ -3,6 +3,21 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {dossierBodyId} from '../dossier.js';
 import {carrierCardSections} from '../core.js';
+const openingMessages = () => [{is_user:false,mes:'<customized>自定义开局开始</customized>'},{is_user:true,mes:`【剧情生成上下文】
+姓名: 林晓
+年龄: 28岁
+【初始开局剧情】
+【自定义开局】
+描述: # 林晓的开局档案
+## 一、人物小传
+出生于河畔小城。
+# 二、基础资料
+姓名：林晓
+种族：人类
+# 三、技能与魔法
+擅长风景画。
+# 四、角色扮演与叙事规则
+不代替玩家选择。`}];
 let ctx,book,saveCount,fetchCount,readbackOK=true,changeDuringRead=false,injectedPrompt='';
 globalThis.document={readyState:'loading',addEventListener(){},getElementById(){return null;},querySelector(){return null;}};
 globalThis.SillyTavern={getContext:()=>ctx};
@@ -15,6 +30,38 @@ const url=new URL('../index.js',import.meta.url);let source=await readFile(url,'
 const plugin=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const card='【当前载体人物设定开始】\n<div><b>世代编号：</b>第2世<br><b>姓名：</b>新身体<br></div>\n【当前载体人物设定结束】';
 const draft='词条名称: 第1世·旧身体\n重要人物: 守卫\n重要经历：守住城门。';
+test('custom opening builds both dossiers, injects every chapter, survives hiding and backup restore',async()=>{
+ setup();const stat={主角:{种族:'人类',职业:['画师'],生命值:{当前:100},金钱:10}};
+ ctx.chat=openingMessages();ctx.chat.push({mes:'<gametxt>她在旅店门前站定。</gametxt><char_info>姓名：乐师</char_info>',stat_data:stat});
+ ctx.chatMetadata={};await plugin.updateCurrentBodyPrompt();
+ const ledger=ctx.chatMetadata.legacy_life_manager;
+ assert.equal(ledger.currentBody.profile.姓名,'林晓');
+ assert.equal(ledger.currentBody.sourceType,'opening');
+ assert.equal(ledger.currentBody.sections.length,5);
+ assert.equal(ledger.lives.length,0);assert.equal(ledger.trustedCarrierRecordKeys.length,0);
+ assert.equal(stat.主角.金钱,10);assert.equal(stat.主角.换身状态,undefined);
+ assert.match(injectedPrompt,/擅长风景画/);assert.match(injectedPrompt,/角色扮演与叙事规则/);
+ assert.ok(injectedPrompt.includes(ledger.currentBody.dynamicDossier.text));
+ ctx.chat[1].is_system=true;await plugin.updateCurrentBodyPrompt();assert.match(injectedPrompt,/出生于河畔小城/);
+ const payload={format:'sillytavern-legacy-life-backup',version:2,chatId:'test',pluginLedger:structuredClone(ledger),pluginSettings:{},statData:stat};
+ const envelope={...payload,integrity:await plugin.backupDigest(payload)};
+ ledger.currentBody=null;
+ const result=await plugin.importBackupPayload(envelope,{ask:false});
+ assert.equal(result.activated,true);assert.equal(ledger.currentBody.sourceType,'opening');
+ assert.equal(ledger.trustedCarrierRecordKeys.length,0);assert.equal(ledger.aiInjectionReceipt.verified,true);
+ assert.match(injectedPrompt,/擅长风景画/);
+});
+test('opening suppression and real confirmed handoff are never bypassed by startup recovery',async()=>{
+ const after=setup();plugin.reconcileConversation();const confirmed=ctx.chatMetadata.legacy_life_manager.currentBody;
+ const ending=ctx.chat;
+ ctx.chat=[...openingMessages(),...ending];plugin.reconcileConversation();
+ assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.sourceType,'conversation');
+ assert.equal(ctx.chatMetadata.legacy_life_manager.currentBody.profile.姓名,confirmed.profile.姓名);
+ setup();ctx.chat=openingMessages();ctx.chat[1].stat_data={主角:{种族:'人类'}};ctx.chatMetadata={};
+ await plugin.updateCurrentBodyPrompt();const data=ctx.chatMetadata.legacy_life_manager;
+ const key=data.currentBody.sourceRecordKey;data.currentBody=null;data.suppressedRecordKeys=[key];
+ await plugin.updateCurrentBodyPrompt();assert.equal(data.currentBody,null);assert.equal(injectedPrompt,'');
+});
 function setup(){
  saveCount=0;fetchCount=0;readbackOK=true;changeDuringRead=false;injectedPrompt='';book={entries:{}};
  const before={主角:{金钱:123456,载体档案:{姓名:'旧身体'},换身状态:{阶段:'等待确认',当前身体死亡已确认:true,当前世代编号:1,待确认人物卡:card,当前身体死亡信息:'已死亡',待归档人生词条:'',归档写入状态:'无待处理'}},历代记忆摘要:[]};

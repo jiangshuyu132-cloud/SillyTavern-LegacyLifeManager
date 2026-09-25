@@ -37,11 +37,42 @@ globalThis.SillyTavern={getContext:()=>qaContext};
 globalThis.getVariables=()=>({stat_data:stat});
 globalThis.toastr={info:console.log,warning:console.warn,error:console.error,success:console.log};
 const repairMode=new URLSearchParams(location.search).has('repair');
+const openingMode=new URLSearchParams(location.search).has('opening');
+if(openingMode){
+    qaContext.chat=[{mes:'<customized>自定义开局开始</customized>'},{is_user:true,mes:`【剧情生成上下文】
+姓名: 林晓
+年龄: 28岁
+【初始开局剧情】
+【自定义开局】
+描述: # 林晓的开局资料
+## 一、人物小传
+出生于河畔小城，成年后学习绘画。
+# 二、基础资料
+姓名：林晓
+种族：人类
+# 三、外貌细节
+妆容：无
+头发：黑色长发
+# 四、技能与魔法
+## 风景画
+善于描绘河流与山林。
+# 五、人际关系
+## 画店老板
+长期合作的朋友。`},{mes:'<gametxt>她站在画店门前。</gametxt>',stat_data:stat}];
+    delete qaContext.chatMetadata.legacy_life_manager;
+}
 if(repairMode){
     const mixed=[changes[0],{...changes[1],evidence:'她穿着蓝衣出门了，但原文并非这样写。'}];
     qaContext.chat[0].mes='她化好**淡红唇妆**和细眼线，换上了蓝色外套。<details><summary>本轮人物更新</summary><LegacyBodyUpdate>'+JSON.stringify({version:1,bodyId:dossierBodyId(body),changes:mixed})+'</LegacyBodyUpdate></details>';
 }
 await import('/index.js');
+if(openingMode){
+    await globalThis.legacyLifeManagerGenerationInterceptor([],50000,()=>{},'normal');
+    const receipt=document.createElement('pre');receipt.id='qa-receipt';
+    const b=qaContext.chatMetadata.legacy_life_manager.currentBody;
+    receipt.textContent=`开局来源：${b.sourceType}\n板块数量：${b.sections.length}\n完整动态档案已写入提示：${qaContext.extensionPrompts.legacy_life_manager_current_body.value.includes(b.dynamicDossier.text)}\n原档保留：${b.rawCard.includes('妆容：无')}`;
+    document.body.prepend(receipt);
+}
 if(repairMode){
     const controls=document.createElement('aside');
     const output=document.createElement('pre');output.id='qa-receipt';
